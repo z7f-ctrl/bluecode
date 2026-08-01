@@ -13,10 +13,13 @@ source <你的 venv 路径>/bin/activate
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 配置模型（任意 OpenAI 兼容端点，走环境变量）
-export OPENAI_API_KEY=sk-xxx
-export OPENAI_BASE_URL=<你的 OpenAI 兼容端点>
-export MODEL_NAME=<你的模型名>
+# 3. 配置模型（任意 OpenAI 兼容端点）
+cp .env.example .env   # 然后编辑 .env，填入真实值（.env 已被 .gitignore 排除，不入库）
+# 或直接走环境变量：
+# export OPENAI_API_KEY=sk-xxx
+# export OPENAI_BASE_URL=<你的 OpenAI 兼容端点>
+# export MODEL_NAME=<你的模型名>
+# 两种方式等效，agent.py 会自动加载 .env；显式环境变量优先于 .env。
 
 # 4. 跑一个需求
 python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
@@ -92,7 +95,9 @@ langgraph/
 ├── prompts.py          # planner / agent / 毒舌评审 / report 提示词
 ├── validate_graph.py   # 离线功能验证（fake model，不需 API key）
 ├── requirements.txt
-└── design.md           # 设计稿（§5~§8 是实现的直接来源）
+├── .env.example     # 配置模板（入库），复制为 .env 后填真实值
+├── .env             # 本地配置（不入库，含密钥）
+└── design.md        # 设计稿（§5~§8 是实现的直接来源）
 ```
 
 > AGENTS.md（含本地环境细节）已被 .gitignore 排除，不入库。
@@ -119,7 +124,7 @@ python validate_graph.py
 
 ## 安全说明（重要）
 
-- **API key 只走环境变量**，绝不写进代码或配置文件。
+- **API key 只放在本地 `.env`（已被 .gitignore 排除）或环境变量**，绝不写进代码或已提交的文件。不要把 `.env` 同步到网盘/云存储。
 - `test2.py` 硬编码过一个真实 key，**该文件已被 `.gitignore` 排除，不进入版本库**；但它仍在你的本地磁盘上。建议尽快轮换该 key（design §12 已要求），轮换后如确认无敏感信息可移出 .gitignore。
 - 危险命令拦截是启发式的，不是完备沙箱——**真正的安全门槛是 guard 人工审批**，不要让它在无人值守模式下自动运行。
 - 默认只读优先：模型被引导先读后写，写操作必须过审批。

@@ -21,8 +21,14 @@ import re
 import traceback
 from typing import Annotated, Literal, TypedDict
 
+from dotenv import load_dotenv
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+
+# 自动加载项目根目录下的 .env（含 OPENAI_API_KEY / OPENAI_BASE_URL / MODEL_NAME）。
+# .env 已被 .gitignore 排除；显式环境变量优先级高于 .env（load_dotenv 默认不覆盖已存在变量）。
+load_dotenv()
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode

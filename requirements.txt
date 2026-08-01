@@ -2,3 +2,4 @@ langgraph>=1.2
 langchain-openai>=1.4
 langchain-core>=1.5
 grandalf  # 仅 draw_ascii() 打印拓扑需要
+python-dotenv  # 自动加载 .env 配置文件（不入库）

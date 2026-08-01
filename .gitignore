@@ -19,6 +19,8 @@ test1.py
 # 环境/密钥（绝不入库）
 .env
 .env.*
+# 但 .env.example 作为可提交的配置模板保留（放在 .env.* 之后才能覆盖前面的忽略）
+!.env.example
 
 # 编辑器/OS
 .DS_Store
