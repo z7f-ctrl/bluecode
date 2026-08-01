@@ -7,16 +7,16 @@
 ## 快速开始
 
 ```bash
-# 1. 进入虚拟环境（项目已绑定 <本地 venv 路径> venv）
-source /Users/USERNAME/.<本地 venv 路径>/binaries/python/envs/default/bin/activate
+# 1. 进入虚拟环境（如有）
+source <你的 venv 路径>/bin/activate
 
 # 2. 安装依赖
 pip install -r requirements.txt
 
 # 3. 配置模型（任意 OpenAI 兼容端点，走环境变量）
 export OPENAI_API_KEY=sk-xxx
-export OPENAI_BASE_URL=https://<你的 OpenAI 兼容端点>
-export MODEL_NAME=gpt-4o-mini
+export OPENAI_BASE_URL=<你的 OpenAI 兼容端点>
+export MODEL_NAME=<你的模型名>
 
 # 4. 跑一个需求
 python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
@@ -92,9 +92,10 @@ langgraph/
 ├── prompts.py          # planner / agent / 毒舌评审 / report 提示词
 ├── validate_graph.py   # 离线功能验证（fake model，不需 API key）
 ├── requirements.txt
-├── design.md           # 设计稿（§5~§8 是实现的直接来源）
-└── hello.py 等         # 演示脚本（不是生产模块）
+└── design.md           # 设计稿（§5~§8 是实现的直接来源）
 ```
+
+> AGENTS.md（含本地环境细节）已被 .gitignore 排除，不入库。
 
 ## 验证
 

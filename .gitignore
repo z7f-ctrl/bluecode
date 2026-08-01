@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 含本地环境细节/历史 key 前缀，不入库（本地 AI 开发文档）
+AGENTS.md
+
 # 含硬编码 API key，不提交（轮换后如确认干净可移出）
 test2.py
 
