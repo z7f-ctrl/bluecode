@@ -99,7 +99,7 @@ langgraph/
 ## 验证
 
 ```bash
-# 离线四路验证：只读 / 写+审批通过 / 拒绝 / revise 回边
+# 离线六路验证：只读 / 写+审批通过 / 拒绝 / revise 回边 / cwd 越界双路径拦截
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
