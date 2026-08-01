@@ -32,7 +32,7 @@ from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 # 自动加载项目根目录下的 .env（含 OPENAI_API_KEY / OPENAI_BASE_URL / MODEL_NAME）。
@@ -55,6 +55,7 @@ from tools import (
 )
 
 MAX_REVIEW_ROUNDS = 3
+MAX_TOOL_ITERATIONS = 15
 BLUE_DIR = os.path.expanduser("~/.blue")
 DB_PATH = os.path.join(BLUE_DIR, "checkpoints.sqlite")
 
@@ -86,13 +87,19 @@ def initial_state(request: str) -> AgentState:
 tool_node = ToolNode(READ_ONLY_TOOLS)
 
 
-def _make_model():
-    kwargs: dict = {"model": os.environ.get("MODEL_NAME", "gpt-4o-mini")}
-    if os.environ.get("OPENAI_BASE_URL"):
-        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
-    if os.environ.get("OPENAI_API_KEY"):
-        kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
-    return ChatOpenAI(**kwargs).bind_tools(ALL_TOOLS)
+_model_cache: ChatOpenAI | None = None
+
+
+def _make_model() -> ChatOpenAI:
+    global _model_cache
+    if _model_cache is None:
+        kwargs: dict = {"model": os.environ.get("MODEL_NAME", "gpt-4o-mini")}
+        if os.environ.get("OPENAI_BASE_URL"):
+            kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+        if os.environ.get("OPENAI_API_KEY"):
+            kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
+        _model_cache = ChatOpenAI(**kwargs).bind_tools(ALL_TOOLS)
+    return _model_cache
 
 
 def planner(state: AgentState) -> dict:
@@ -116,14 +123,17 @@ def agent(state: AgentState) -> dict:
         tip += f"\n上一轮评审/意见：{state['feedback']}"
 
     messages: list = [SystemMessage(content=AGENT_PROMPT), HumanMessage(content=state["request"])]
+    # revise 回环时 state["messages"] 已被 reviewer 压缩成单条摘要，直接复用
     messages.extend(state["messages"])
     messages.append(HumanMessage(content=tip))
 
     updated: list = []
     pending: list[dict] = list(state.get("pending_changes", []))
     step = state.get("current_step", 0)
+    iterations = 0
 
-    while True:
+    while iterations < MAX_TOOL_ITERATIONS:
+        iterations += 1
         ai: AIMessage = _make_model().invoke(messages)
         messages.append(ai)
         updated.append(ai)
@@ -146,8 +156,16 @@ def agent(state: AgentState) -> dict:
                     )
                 else:
                     pending.append({"action": name, **args})
+                    # 只回摘要，不把完整 content/大段 args 再塞进上下文
+                    summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
+                    if "content" in args:
+                        summary["content_len"] = len(args["content"])
+                    if "old" in args:
+                        summary["old_len"] = len(args["old"])
+                    if "new" in args:
+                        summary["new_len"] = len(args["new"])
                     tool_msg = ToolMessage(
-                        content=f"已暂存待审批：{name}({json.dumps(args, ensure_ascii=False)})",
+                        content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
                         tool_call_id=tc["id"],
                     )
                 messages.append(tool_msg)
@@ -161,6 +179,9 @@ def agent(state: AgentState) -> dict:
         step = min(step + 1, max(len(state.get("plan", [])) or 1, 1))
         if pending:
             break
+    else:
+        # 达到工具迭代上限，强制结束并提示
+        updated.append(AIMessage(content=f"（已达工具迭代上限 {MAX_TOOL_ITERATIONS}，强制收尾）"))
 
     return {"messages": updated, "pending_changes": pending, "current_step": step}
 
@@ -176,6 +197,53 @@ def guard(state: AgentState) -> dict:
         return {"verdict": "revise", "pending_changes": [], "feedback": answer.get("note", "用户要求修改")}
     summary = "\n".join(execute_change(c) for c in state["pending_changes"])
     return {"verdict": "approved", "pending_changes": [], "feedback": summary}
+
+
+def _compress_messages(messages: list, request: str) -> str:
+    """把 agent 的完整工具历史压缩成一段人可读摘要，供 revise 回环时替代原始消息。
+
+    不调用 LLM，用规则提取：读了哪些文件、暂存了哪些改动、执行结果。
+    """
+    read_files: list[str] = []
+    planned_changes: list[str] = []
+    executed_results: list[str] = []
+
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # 提取 read_file 结果
+            if "共" in content and "行" in content and "显示" in content:
+                first_line = content.split("\n")[0]
+                read_files.append(first_line)
+            # 提取暂存信息
+            elif "已暂存待审批" in content:
+                planned_changes.append(content.replace("已暂存待审批：", ""))
+            # 提取命令执行结果
+            elif "命令成功" in content or "命令退出码" in content:
+                executed_results.append(content[:200] + ("…" if len(content) > 200 else ""))
+        elif isinstance(msg, AIMessage):
+            # 提取 plan_* 工具调用的参数摘要
+            for tc in msg.tool_calls or []:
+                name = tc.get("name", "")
+                if name in ("plan_write_file", "plan_patch", "plan_run_command"):
+                    args = tc.get("args", {})
+                    if name == "plan_write_file":
+                        planned_changes.append(f"plan_write_file(path={args.get('path')}, content_len={len(args.get('content', ''))})")
+                    elif name == "plan_patch":
+                        planned_changes.append(f"plan_patch(path={args.get('path')}, old_len={len(args.get('old', ''))}, new_len={len(args.get('new', ''))})")
+                    elif name == "plan_run_command":
+                        planned_changes.append(f"plan_run_command(command={args.get('command')!r})")
+
+    parts = [f"需求：{request}"]
+    if read_files:
+        parts.append(f"读取了 {len(read_files)} 个文件：{'; '.join(read_files[:5])}{'…' if len(read_files) > 5 else ''}")
+    if planned_changes:
+        parts.append(f"暂存了 {len(planned_changes)} 处改动：{'; '.join(planned_changes[:5])}{'…' if len(planned_changes) > 5 else ''}")
+    if executed_results:
+        parts.append(f"执行结果：{'; '.join(executed_results[:3])}")
+    if not (read_files or planned_changes or executed_results):
+        parts.append("（无工具调用历史）")
+    return "\n".join(parts)
 
 
 def reviewer(state: AgentState) -> dict:
@@ -209,7 +277,15 @@ def reviewer(state: AgentState) -> dict:
     if new_verdict == "revise" and new_rounds >= MAX_REVIEW_ROUNDS:
         new_verdict = "pass"
         text = f"（已达评审上限强制放行。历史意见：{text}）"
-    return {"verdict": new_verdict, "feedback": text, "review_rounds": new_rounds}
+
+    # revise 回环时压缩消息历史，避免完整工具调用细节占 token
+    update: dict = {"verdict": new_verdict, "feedback": text, "review_rounds": new_rounds}
+    if new_verdict == "revise":
+        compressed = _compress_messages(state.get("messages", []), state["request"])
+        # 逐条 RemoveMessage 删除旧历史，再追加单条摘要
+        removals = [RemoveMessage(id=m.id) for m in state.get("messages", []) if m.id]
+        update["messages"] = removals + [HumanMessage(content=f"【上一轮执行摘要】\n{compressed}")]
+    return update
 
 
 def report(state: AgentState) -> dict:
@@ -413,6 +489,10 @@ def _print_node(node_name: str, output: dict) -> None:
     elif node_name == "agent" and output.get("pending_changes"):
         for c in output["pending_changes"]:
             shown = {k: v for k, v in c.items() if k != "action"}
+            # 大字段只显示长度，不打印完整内容
+            for big in ("content", "old", "new"):
+                if big in shown:
+                    shown[f"{big}_len"] = len(shown.pop(big))
             print(f"[蓝] 已暂存待审批 → {c['action']}({json.dumps(shown, ensure_ascii=False)})")
     elif node_name == "guard":
         print(f"[蓝] 审批结果：{output.get('verdict')}")

@@ -59,7 +59,8 @@ def list_files(dir: str = ".") -> str:
 
 @tool
 def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> str:
-    """带行号读取文件内容。start_line/end_line 限定行区间（1 起），省略则读全部。"""
+    """带行号读取文件内容。start_line/end_line 限定行区间（1 起），省略则读全部。
+    单次最多读取 500 行；如文件更长，请用 start_line/end_line 分段读取。"""
     p = _resolve(path)
     if not p.is_file():
         return f"错误：{path} 不是文件或不存在"
@@ -67,10 +68,14 @@ def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> st
     total = len(lines)
     start = max(1, start_line)
     end = total if end_line is None else min(total, end_line)
+    # 默认上限 500 行，防止大文件一次撑爆上下文
+    if end_line is None and end - start + 1 > 500:
+        end = start + 499
     if start > total:
         return f"（文件共 {total} 行，起始行超出范围）"
     body = "\n".join(f"{i}: {lines[i-1]}" for i in range(start, end + 1))
-    return f"{path}（共 {total} 行，显示 {start}~{end} 行）：\n{body}"
+    suffix = f"\n…（共 {total} 行，仅显示 {start}~{end}；请用 start_line/end_line 继续）" if end < total else ""
+    return f"{path}（共 {total} 行，显示 {start}~{end} 行）：\n{body}{suffix}"
 
 
 @tool
@@ -106,7 +111,8 @@ def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
 @tool
 def plan_write_file(path: str, content: str) -> str:
     """【暂存】计划写入/覆盖一个文件。不会真的执行，只会加入待审批列表。
-    content 为完整的新内容。审批通过与后会真正写入。"""
+    content 为完整的新内容。审批通过与后会真正写入。
+    注意：如果文件很长（>100 行），优先考虑用 plan_patch 做局部修改，避免重复传输全量内容。"""
     _resolve(path)  # 仅校验路径合法性，不执行
     return f"plan_write_file(path={path}, content_len={len(content)}) 已暂存——等待审批。"
 
@@ -114,7 +120,8 @@ def plan_write_file(path: str, content: str) -> str:
 @tool
 def plan_patch(path: str, old: str, new: str) -> str:
     """【暂存】计划替换文件中某段文本（old→new）。不会真的执行。
-    审批通过后会先在文件中找到唯一的 old 再替换。"""
+    审批通过后会先在文件中找到唯一的 old 再替换。
+    适用于局部修改，比 plan_write_file 更节省 token。"""
     _resolve(path)
     return f"plan_patch(path={path}, old_len={len(old)}, new_len={len(new)}) 已暂存——等待审批。"
 
