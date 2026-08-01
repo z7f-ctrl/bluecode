@@ -102,7 +102,21 @@ def _make_model() -> ChatOpenAI:
     return _model_cache
 
 
+def should_skip_planner(request: str) -> bool:
+    """判断需求是否简单到不需要 planner 拆解。"""
+    # 一句话能说完、无多文件/多步骤迹象的需求直接进 agent
+    if len(request) > 30:
+        return False
+    # 包含这些词说明可能有多步骤
+    multi_step_indicators = ["和", "并", "同时", "然后", "接着", "再", "另外", "加上", "以及", "multiple", "and then"]
+    if any(w in request for w in multi_step_indicators):
+        return False
+    return True
+
+
 def planner(state: AgentState) -> dict:
+    if should_skip_planner(state["request"]):
+        return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed"}
     resp = _make_model().invoke(
         [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])]
     )
@@ -195,7 +209,11 @@ def guard(state: AgentState) -> dict:
         return {"verdict": "rejected", "pending_changes": [], "feedback": answer.get("note", "用户拒绝")}
     if action == "modify":
         return {"verdict": "revise", "pending_changes": [], "feedback": answer.get("note", "用户要求修改")}
+    # 记录改动文件列表，供 verifier 做语法检查
+    changed_files = [c.get("path", "") for c in state["pending_changes"] if c.get("path")]
     summary = "\n".join(execute_change(c) for c in state["pending_changes"])
+    if changed_files:
+        summary += f"\n\n【改动文件】{'; '.join(changed_files)}"
     return {"verdict": "approved", "pending_changes": [], "feedback": summary}
 
 
@@ -222,17 +240,17 @@ def _compress_messages(messages: list, request: str) -> str:
             elif "命令成功" in content or "命令退出码" in content:
                 executed_results.append(content[:200] + ("…" if len(content) > 200 else ""))
         elif isinstance(msg, AIMessage):
-            # 提取 plan_* 工具调用的参数摘要
+            # 提取只读工具调用的参数摘要（plan_* 已由 ToolMessage 覆盖，避免重复）
             for tc in msg.tool_calls or []:
                 name = tc.get("name", "")
-                if name in ("plan_write_file", "plan_patch", "plan_run_command"):
+                if name in ("read_file", "grep", "list_files"):
                     args = tc.get("args", {})
-                    if name == "plan_write_file":
-                        planned_changes.append(f"plan_write_file(path={args.get('path')}, content_len={len(args.get('content', ''))})")
-                    elif name == "plan_patch":
-                        planned_changes.append(f"plan_patch(path={args.get('path')}, old_len={len(args.get('old', ''))}, new_len={len(args.get('new', ''))})")
-                    elif name == "plan_run_command":
-                        planned_changes.append(f"plan_run_command(command={args.get('command')!r})")
+                    if name == "read_file":
+                        read_files.append(f"read_file(path={args.get('path')})")
+                    elif name == "grep":
+                        read_files.append(f"grep(pattern={args.get('pattern')!r})")
+                    elif name == "list_files":
+                        read_files.append(f"list_files(dir={args.get('dir', '.')})")
 
     parts = [f"需求：{request}"]
     if read_files:
@@ -244,6 +262,73 @@ def _compress_messages(messages: list, request: str) -> str:
     if not (read_files or planned_changes or executed_results):
         parts.append("（无工具调用历史）")
     return "\n".join(parts)
+
+
+def verifier(state: AgentState) -> dict:
+    """审批通过后自动验证：语法检查 + 尝试跑测试。结果供 reviewer 参考。"""
+    verdict = state.get("verdict", "proceed")
+    if verdict != "approved":
+        # 只读/拒绝/修改 不需要验证
+        return {"feedback": state.get("feedback", "")}
+
+    feedback = state.get("feedback", "")
+    results: list[str] = []
+
+    # 从 feedback 解析改动文件列表（guard 执行后写入）
+    changed_files: list[str] = []
+    if "【改动文件】" in feedback:
+        files_part = feedback.split("【改动文件】")[-1].strip()
+        changed_files = [f.strip() for f in files_part.split(";") if f.strip()]
+
+    # 1. 语法检查：对所有改动过的 .py 文件跑 py_compile
+    import py_compile
+    for path in changed_files:
+        if path.endswith(".py"):
+            try:
+                p = _resolve(path)
+                py_compile.compile(str(p), doraise=True)
+                results.append(f"✓ {path} 语法检查通过")
+            except py_compile.PyCompileError as exc:
+                results.append(f"✗ {path} 语法错误：{exc.msg}")
+            except Exception as exc:
+                results.append(f"? {path} 语法检查异常：{exc}")
+
+    # 2. 尝试发现测试并执行（如果项目里有测试文件）
+    test_files = []
+    try:
+        for item in _resolve(".").rglob("test_*.py"):
+            test_files.append(str(item.relative_to(_resolve("."))))
+        for item in _resolve(".").rglob("*_test.py"):
+            test_files.append(str(item.relative_to(_resolve("."))))
+    except Exception:
+        pass
+
+    if test_files:
+        import subprocess
+        # 最多跑 3 个测试文件，避免超时
+        for tf in test_files[:3]:
+            try:
+                r = subprocess.run(
+                    ["python3", "-m", "pytest", tf, "-v", "--tb=short"],
+                    capture_output=True, text=True, timeout=30, cwd=_resolve(".")
+                )
+                if r.returncode == 0:
+                    results.append(f"✓ {tf} 测试通过")
+                else:
+                    # 只保留关键错误行
+                    err_lines = [l for l in r.stdout.split("\n") if "FAILED" in l or "Error" in l or "assert" in l.lower()]
+                    results.append(f"✗ {tf} 测试失败：{'; '.join(err_lines[:3])}")
+            except subprocess.TimeoutExpired:
+                results.append(f"? {tf} 测试超时（30s）")
+            except Exception as exc:
+                results.append(f"? {tf} 测试执行异常：{exc}")
+
+    if results:
+        feedback += "\n\n【自动验证结果】\n" + "\n".join(results)
+    else:
+        feedback += "\n\n【自动验证结果】无 .py 改动或未找到测试文件"
+
+    return {"feedback": feedback}
 
 
 def reviewer(state: AgentState) -> dict:
@@ -327,12 +412,14 @@ def build_graph(checkpointer=None):
     builder.add_node("planner", planner)
     builder.add_node("agent", agent)
     builder.add_node("guard", guard)
+    builder.add_node("verifier", verifier)
     builder.add_node("reviewer", reviewer)
     builder.add_node("report", report)
     builder.add_edge(START, "planner")
     builder.add_edge("planner", "agent")
     builder.add_edge("agent", "guard")
-    builder.add_edge("guard", "reviewer")
+    builder.add_edge("guard", "verifier")
+    builder.add_edge("verifier", "reviewer")
     builder.add_conditional_edges(
         "reviewer", route_by_verdict, {"agent": "agent", "report": "report"}
     )
@@ -485,7 +572,12 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
 
 def _print_node(node_name: str, output: dict) -> None:
     if node_name == "planner":
-        print(f"[蓝] 计划：{json.dumps(output.get('plan', []), ensure_ascii=False)}")
+        plan = output.get("plan", [])
+        # planner 条件化：单步且与需求原文一致 → 简单需求直接执行
+        if len(plan) == 1:
+            print("[蓝] 简单需求，直接执行")
+        else:
+            print(f"[蓝] 计划：{json.dumps(plan, ensure_ascii=False)}")
     elif node_name == "agent" and output.get("pending_changes"):
         for c in output["pending_changes"]:
             shown = {k: v for k, v in c.items() if k != "action"}
@@ -496,9 +588,15 @@ def _print_node(node_name: str, output: dict) -> None:
             print(f"[蓝] 已暂存待审批 → {c['action']}({json.dumps(shown, ensure_ascii=False)})")
     elif node_name == "guard":
         print(f"[蓝] 审批结果：{output.get('verdict')}")
+    elif node_name == "verifier":
+        fb = output.get("feedback", "")
+        if "【自动验证结果】" in fb:
+            # 只打印验证部分，不重复执行结果
+            verify_part = fb.split("【自动验证结果】")[-1].strip()
+            print(f"[蓝] 🔍 自动验证：{verify_part}")
     elif node_name == "reviewer":
         mark = "✅ 放行" if output.get("verdict") == "pass" else "🔪 打回"
-        print(f"[毒舌评审] {mark}｜{output.get('feedback', '')}")
+        print(f"[评审] {mark}｜{output.get('feedback', '')}")
     elif node_name == "report":
         print(f"\n[蓝] {output.get('feedback', '')}")
 

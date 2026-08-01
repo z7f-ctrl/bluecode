@@ -34,12 +34,17 @@ class FakeModel:
 
 
 def run_on(model_fake, request, resume_action=None, thread_id="test-1"):
-    """跑一个 thread，遇 interrupt 用 resume_action 续命。返回 (node顺序, 最终state)。"""
+    """跑一个 thread，遇 interrupt 用 resume_action 续命。返回 (node顺序, 最终state)。
+
+    注意：patch 掉 should_skip_planner，保证 planner 总是消耗一次模型调用，
+    使 fake model 的脚本化响应序列与各节点一一对应。skip 路径由专门测试覆盖。
+    """
     graph = agent.build_graph(checkpointer=MemorySaver())
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     state = agent.initial_state(request)
     order = []
-    with patch("agent._make_model", lambda: model_fake):
+    with patch("agent._make_model", lambda: model_fake), \
+         patch("agent.should_skip_planner", lambda r: False):
         # 首轮
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for n, _o in chunk.items():
@@ -194,7 +199,8 @@ def test_multi_round_same_thread():
         config: RunnableConfig = {"configurable": {"thread_id": thread}}
         state = agent.initial_state(request)
         order = []
-        with patch("agent._make_model", lambda: model_fake):
+        with patch("agent._make_model", lambda: model_fake), \
+             patch("agent.should_skip_planner", lambda r: False):
             for chunk in graph.stream(state, config=config, stream_mode="updates"):
                 for n, _o in chunk.items():
                     order.append(n)
@@ -294,6 +300,45 @@ def test_revise_compresses_messages():
     print("PASS revise message compression ✔\n")
 
 
+def test_skip_planner_for_simple_request():
+    """简单需求（短、无多步骤词）应跳过 planner 的模型调用，直接单步计划。"""
+    assert agent.should_skip_planner("统计行数") is True
+    assert agent.should_skip_planner("读一下 hello.py") is True
+    assert agent.should_skip_planner("修复 bug 并添加测试") is False  # 含"并"
+    assert agent.should_skip_planner("这是一个非常长的需求描述，超过三十个字 therefore 需要 planner 拆解") is False
+
+    # skip 时 planner 不消耗模型调用：fake model 第一个响应应被 agent 拿到
+    calls = [
+        AIMessage(content="直接用 grep 查", tool_calls=[
+            {"name": "grep", "args": {"pattern": "hello"}, "id": "g1"}]),
+        AIMessage(content="统计完成。"),
+        AIMessage(content="verdict: pass\nfeedback: 只读。"),
+        AIMessage(content="# 报告\n完成。"),
+    ]
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": "skip-test"}}
+    state = agent.initial_state("统计 hello 出现次数")
+    order = []
+    with patch("agent._make_model", lambda: FakeModel(calls)):
+        for chunk in graph.stream(state, config=config, stream_mode="updates"):
+            for n, _o in chunk.items():
+                order.append(n)
+        while True:
+            cur = graph.get_state(config)
+            if not cur.next:
+                break
+            for task in cur.tasks:
+                if task.interrupts:
+                    for chunk in graph.stream(agent.Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
+                        for n, _o in chunk.items():
+                            order.append(n)
+    final = graph.get_state(config).values
+    print("skip-planner order:", "→".join(order))
+    assert final["plan"] == ["统计 hello 出现次数"], "skip 时应退化为单步计划"
+    assert final["verdict"] == "pass"
+    print("PASS skip planner for simple request ✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -304,6 +349,7 @@ if __name__ == "__main__":
         test_multi_round_same_thread()
         test_session_meta_persistence()
         test_revise_compresses_messages()
+        test_skip_planner_for_simple_request()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
