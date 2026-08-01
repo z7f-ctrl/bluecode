@@ -23,8 +23,8 @@
 
 ```bash
 export OPENAI_API_KEY=sk-xxx
-export OPENAI_BASE_URL=https://<你的 OpenAI 兼容端点>
-export MODEL_NAME=gpt-4o-mini
+export OPENAI_BASE_URL=<你的 OpenAI 兼容端点>
+export MODEL_NAME=<你的模型名>
 
 python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 ```
