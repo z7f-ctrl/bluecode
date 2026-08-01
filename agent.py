@@ -34,6 +34,7 @@ from tools import (
     ALL_TOOLS,
     PLAN_TOOL_NAMES,
     READ_ONLY_TOOLS,
+    _resolve,
     check_command_safety,
     execute_change,
 )
@@ -118,6 +119,7 @@ def agent(state: AgentState) -> dict:
                 if name == "plan_run_command":
                     try:
                         check_command_safety(args.get("command", ""))
+                        _resolve(args.get("cwd", "."))
                     except ValueError as exc:
                         blocked = str(exc)
                 if blocked:

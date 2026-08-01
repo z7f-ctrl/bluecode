@@ -178,9 +178,10 @@ def execute_change(change: dict) -> str:
         if action == "plan_run_command":
             cmd, _cwd = change["command"], change.get("cwd", ".")
             check_command_safety(cmd)
+            run_dir = _resolve(_cwd)  # cwd 同样受沙箱约束，越界直接拒绝
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True,
-                timeout=_DEFAULT_TIMEOUT, cwd=WORKDIR / _cwd,
+                timeout=_DEFAULT_TIMEOUT, cwd=run_dir,
             )
             out = result.stdout[-3000:] if result.stdout else ""
             err = result.stderr[-3000:] if result.stderr else ""

@@ -141,9 +141,35 @@ def test_revise_loops_back():
     print()
 
 
+def test_run_command_cwd_sandbox():
+    # 方案B：cwd 必须受沙箱约束。两条路径都要拦截越界 cwd。
+    from tools import execute_change
+
+    # ① 最后防线：execute_change 直接拒绝越界 cwd（不得真执行）
+    res = execute_change({"action": "plan_run_command", "command": "pwd", "cwd": "../../../../etc"})
+    print("execute_change cwd 越界结果:", res)
+    assert "执行失败" in res and "越界" in res, f"越界 cwd 应被拒，实际：{res}"
+    print("PASS cwd sandbox（execute_change 最后防线）✔\n")
+
+    # ② 提前拦截：agent 暂存阶段就把越界 cwd 挡下，不进 pending_changes
+    bad_calls = [
+        AIMessage(content='["跑命令"]'),
+        AIMessage(content="跑一下。", tool_calls=[
+            {"name": "plan_run_command",
+             "args": {"command": "ls", "cwd": "../../../../etc"}, "id": "c1"}]),
+        AIMessage(content="命令被拦截了？给用户答复。"),   # 不再产出新工具调用
+    ]
+    order, state = run_on(FakeModel(bad_calls), "在 /etc 下跑 ls", resume_action={"action": "approve"})
+    print("cwd-blocked node order:", "→".join(order))
+    assert state["pending_changes"] == [], "越界 cwd 不应进入待审批列表"
+    assert state["verdict"] != "approved"
+    print("PASS cwd sandbox（agent 暂存提前拦截）✔\n")
+
+
 if __name__ == "__main__":
     test_readonly_no_interrupt()
     test_write_requires_resume()
     test_reject_no_write()
     test_revise_loops_back()
+    test_run_command_cwd_sandbox()
     print("ALL OFFLINE TESTS PASSED ✅")
