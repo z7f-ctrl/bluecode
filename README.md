@@ -32,7 +32,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
 | `python validate_graph.py` | 离线功能验证，不需要 API key |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
-| `python agent.py --resume` | v0.2 占位，暂未实现 |
+|| `python agent.py --resume` | 列出历史会话并恢复（v0.2 已实现） |
 
 ## 它是怎么工作的
 
@@ -117,7 +117,7 @@ python validate_graph.py
 | 版本 | 内容 | 状态 |
 |---|---|---|
 | v0.1 | 单文件跑通 plan→act→guard→review 全流程 + CLI 交互 | ✅ 已实现 |
-| v0.2 | `SqliteSaver` 持久化 + `--resume` / 会话列表 | 未实现 |
+| v0.2 | `SqliteSaver` 持久化 + 多轮会话 + 斜杠命令 + `--resume` | ✅ 已实现 |
 | v0.3 | 多文件并行修改（`Send`），评审意见按文件分发 | 未实现 |
 | v0.4 | LangGraph Studio 可视化调试 | 未实现 |
 | v0.5 | 评测集（10 个标准任务） | 未实现 |
@@ -129,9 +129,25 @@ python validate_graph.py
 - 危险命令拦截是启发式的，不是完备沙箱——**真正的安全门槛是 guard 人工审批**，不要让它在无人值守模式下自动运行。
 - 默认只读优先：模型被引导先读后写，写操作必须过审批。
 
-## 已知限制（v0.1）
+## 已知限制（v0.2）
 
-- `--resume` 尚未实现（v0.2）。
 - `astream_events` token 级流式输出未做，当前是节点级播报。
 - reviewer 的 `feedback` 会携带原始 `verdict:` 行一起打印，略显粗糙。
 - 毒舌评审每次任务要多轮 LLM 调用（通常 4~7 次），API 限流时体验会慢。
+- 会话元信息（`sessions` 表）与 LangGraph checkpoint 分开存储，极端情况下可能不一致（如手动删 checkpoint 文件）。
+
+## 多轮会话与斜杠命令（v0.2 新增）
+
+直接运行 `python agent.py`（不带参数）即进入多轮模式：
+
+```
+> 给 hello.py 加错误处理
+...（图执行 + 审批）...
+> /history       # 查看当前会话状态
+> /clear         # 开启新 thread，清空上下文
+> /quit          # 退出
+```
+
+可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume`。
+
+会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。

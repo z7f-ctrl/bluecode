@@ -1,10 +1,22 @@
-"""离线功能验证：用 fake model 跑完整图，验证 interrupt/resume 与条件路由。"""
+"""离线功能验证：用 fake model 跑完整图，验证 interrupt/resume 与条件路由。
+
+注意：离线测试使用 MemorySaver + 临时 sqlite 文件，避免污染真实 ~/.blue/checkpoints.sqlite。
+"""
+import os
+import tempfile
 from unittest.mock import patch
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import MemorySaver
+
+# 在 import agent 之前把 DB_PATH 指到临时文件，避免测试写入用户真实数据库
+_TMP_DB = tempfile.NamedTemporaryFile(prefix="blue-test-", suffix=".sqlite", delete=False)
+_TMP_DB.close()
+os.environ.setdefault("BLUE_TEST_DB", _TMP_DB.name)
 
 import agent
+agent.DB_PATH = os.environ["BLUE_TEST_DB"]
 
 
 class FakeModel:
@@ -21,10 +33,10 @@ class FakeModel:
         return AIMessage(content=item)
 
 
-def run_on(model_fake, request, resume_action=None):
+def run_on(model_fake, request, resume_action=None, thread_id="test-1"):
     """跑一个 thread，遇 interrupt 用 resume_action 续命。返回 (node顺序, 最终state)。"""
-    graph = agent.build_graph()
-    config: RunnableConfig = {"configurable": {"thread_id": "test-1"}}
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     state = agent.initial_state(request)
     order = []
     with patch("agent._make_model", lambda: model_fake):
@@ -166,10 +178,113 @@ def test_run_command_cwd_sandbox():
     print("PASS cwd sandbox（agent 暂存提前拦截）✔\n")
 
 
+def test_multi_round_same_thread():
+    """多轮会话：同一 thread_id 跨两次 build_graph（模拟进程重启），checkpoint 仍在。"""
+    import sqlite3
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    thread = "multi-round-test"
+    db = os.environ["BLUE_TEST_DB"]
+
+    def fresh_graph():
+        conn = sqlite3.connect(db, check_same_thread=False)
+        return agent.build_graph(checkpointer=SqliteSaver(conn))
+
+    def run_with(graph, model_fake, request, resume_action=None):
+        config: RunnableConfig = {"configurable": {"thread_id": thread}}
+        state = agent.initial_state(request)
+        order = []
+        with patch("agent._make_model", lambda: model_fake):
+            for chunk in graph.stream(state, config=config, stream_mode="updates"):
+                for n, _o in chunk.items():
+                    order.append(n)
+            while True:
+                cur = graph.get_state(config)
+                if not cur.next:
+                    break
+                for task in cur.tasks:
+                    if task.interrupts:
+                        val = resume_action or {"action": "approve"}
+                        for chunk in graph.stream(agent.Command(resume=val), config=config, stream_mode="updates"):
+                            for n, _o in chunk.items():
+                                order.append(n)
+        return order, graph.get_state(config).values
+
+    # 第一轮："进程 1"：只读任务
+    calls1 = [
+        AIMessage(content='["读文件"]'),
+        AIMessage(content="用 grep 查一下", tool_calls=[
+            {"name": "grep", "args": {"pattern": "hello"}, "id": "g1"}]),
+        AIMessage(content="第一轮完成。"),
+        AIMessage(content="verdict: pass\nfeedback: 只读无风险。"),
+        AIMessage(content="# 报告\n第一轮结束。"),
+    ]
+    g1 = fresh_graph()
+    order1, state1 = run_with(g1, FakeModel(calls1), "第一轮：统计 hello")
+    print("round1 order:", "→".join(order1))
+    assert state1["verdict"] == "pass"
+
+    # 第二轮："进程 2"：新建 graph（模拟重启），同 thread 继续
+    calls2 = [
+        AIMessage(content='["写文件"]'),
+        AIMessage(content="计划写文件。", tool_calls=[
+            {"name": "plan_write_file", "args": {"path": "__mr__.txt", "content": "第二轮\n"}, "id": "w1"}]),
+        AIMessage(content="已写入。"),
+        AIMessage(content="verdict: pass\nfeedback: 简单。"),
+        AIMessage(content="# 报告\n第二轮结束。"),
+    ]
+    g2 = fresh_graph()
+    try:
+        order2, state2 = run_with(g2, FakeModel(calls2), "第二轮：写文件", resume_action={"action": "approve"})
+        print("round2 order:", "→".join(order2))
+        assert state2["verdict"] == "pass"
+        assert state2["pending_changes"] == []
+        assert os.path.exists("__mr__.txt"), "审批后应真的写入文件"
+    finally:
+        if os.path.exists("__mr__.txt"):
+            os.remove("__mr__.txt")
+
+    # sqlite 里应真有该 thread 的 checkpoint 记录
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (thread,)
+        ).fetchone()
+        assert row and row[0] > 0, "sqlite 中应存在该 thread 的 checkpoint"
+    finally:
+        conn.close()
+    print("PASS multi-round same thread（跨 graph 实例，sqlite 持久化生效）✔\n")
+
+
+def test_session_meta_persistence():
+    """会话元信息应写入 sessions 辅助表。"""
+    sess = agent.Session()
+    sess.round = 3
+    agent._save_session_meta(sess)
+    sessions = agent.list_sessions()
+    found = [s for s in sessions if s["thread_id"] == sess.thread_id]
+    assert found, f"sessions 表应包含 {sess.thread_id}"
+    assert found[0]["rounds"] == 3
+    print("PASS session meta persistence ✔\n")
+
+
 if __name__ == "__main__":
-    test_readonly_no_interrupt()
-    test_write_requires_resume()
-    test_reject_no_write()
-    test_revise_loops_back()
-    test_run_command_cwd_sandbox()
-    print("ALL OFFLINE TESTS PASSED ✅")
+    try:
+        test_readonly_no_interrupt()
+        test_write_requires_resume()
+        test_reject_no_write()
+        test_revise_loops_back()
+        test_run_command_cwd_sandbox()
+        test_multi_round_same_thread()
+        test_session_meta_persistence()
+        print("ALL OFFLINE TESTS PASSED ✅")
+    finally:
+        # 清理临时数据库文件
+        if os.path.exists(_TMP_DB.name):
+            os.unlink(_TMP_DB.name)
+        wal = _TMP_DB.name + "-wal"
+        if os.path.exists(wal):
+            os.unlink(wal)
+        shm = _TMP_DB.name + "-shm"
+        if os.path.exists(shm):
+            os.unlink(shm)

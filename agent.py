@@ -1,4 +1,4 @@
-"""小蓝 Blue —— 基于 LangGraph 的本地个人 coding agent。v0.1 实现。
+"""小蓝 Blue —— 基于 LangGraph 的本地个人 coding agent。v0.2 实现。
 
 图：planner → agent → guard → reviewer →(pass/report | revise/agent)→ report → END
 
@@ -9,6 +9,12 @@
 - reviewer  毒舌自审，输出 pass / revise
 - report    收尾汇总
 
+v0.2 新增：
+- SqliteSaver 持久化（~/.blue/checkpoints.sqlite）
+- 多轮会话（同一 thread 内连续提交需求）
+- 斜杠命令（/help /quit /clear /history /graph 等）
+- --resume 恢复历史会话
+
 CLI 交互在 __main__ 分支。
 """
 
@@ -18,7 +24,10 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import traceback
+import uuid
+from datetime import datetime
 from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
@@ -32,7 +41,7 @@ load_dotenv()
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
 
 from prompts import AGENT_PROMPT, PLANNER_PROMPT, REPORT_PROMPT, REVIEWER_PROMPT
@@ -46,6 +55,8 @@ from tools import (
 )
 
 MAX_REVIEW_ROUNDS = 3
+BLUE_DIR = os.path.expanduser("~/.blue")
+DB_PATH = os.path.join(BLUE_DIR, "checkpoints.sqlite")
 
 
 class AgentState(TypedDict):
@@ -222,7 +233,20 @@ def route_by_verdict(state: AgentState) -> Literal["agent", "report"]:
     return "agent" if state.get("verdict") == "revise" else "report"
 
 
-def build_graph():
+def _ensure_blue_dir() -> None:
+    os.makedirs(BLUE_DIR, exist_ok=True)
+
+
+def _get_conn() -> sqlite3.Connection:
+    _ensure_blue_dir()
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def build_graph(checkpointer=None):
+    if checkpointer is None:
+        checkpointer = SqliteSaver(_get_conn())
     builder = StateGraph(AgentState)
     builder.add_node("planner", planner)
     builder.add_node("agent", agent)
@@ -237,7 +261,150 @@ def build_graph():
         "reviewer", route_by_verdict, {"agent": "agent", "report": "report"}
     )
     builder.add_edge("report", END)
-    return builder.compile(checkpointer=MemorySaver())
+    return builder.compile(checkpointer=checkpointer)
+
+
+# ─────────────────────────── 会话管理 ───────────────────────────
+
+class Session:
+    """一次交互式会话：维护 thread_id 与轮次，支持多轮需求。"""
+
+    def __init__(self, thread_id: str | None = None):
+        self.thread_id = thread_id or f"blue-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self.round = 0
+        self.created_at = datetime.now().isoformat(timespec="seconds")
+
+    @property
+    def config(self) -> dict:
+        return {"configurable": {"thread_id": self.thread_id}}
+
+    def next_round(self) -> int:
+        self.round += 1
+        return self.round
+
+
+def _save_session_meta(sess: Session) -> None:
+    """把会话元信息写入 sqlite 辅助表，供 --resume 列表查询。"""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                thread_id TEXT PRIMARY KEY,
+                created_at TEXT,
+                last_active TEXT,
+                rounds INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sessions (thread_id, created_at, last_active, rounds)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                last_active = excluded.last_active,
+                rounds = excluded.rounds
+            """,
+            (sess.thread_id, sess.created_at, datetime.now().isoformat(timespec="seconds"), sess.round),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_sessions() -> list[dict]:
+    """从辅助表读历史会话列表。"""
+    if not os.path.exists(DB_PATH):
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT thread_id, created_at, last_active, rounds FROM sessions ORDER BY last_active DESC"
+        ).fetchall()
+        return [
+            {"thread_id": r[0], "created_at": r[1], "last_active": r[2], "rounds": r[3]}
+            for r in rows
+        ]
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+# ─────────────────────────── 斜杠命令 ───────────────────────────
+
+SLASH_HELP = """可用斜杠命令：
+  /help          显示本帮助
+  /quit, /exit   退出当前会话
+  /clear         清空当前会话的上下文（开启新 thread）
+  /history       查看本会话已完成的轮次与状态摘要
+  /graph         打印图拓扑
+  /resume        列出历史会话并恢复（等价于启动时 --resume）
+  /new           强制开启新 thread（保留旧 checkpoint）
+"""
+
+
+def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
+    """处理斜杠命令。返回 (should_continue, new_session_or_none)。
+    should_continue=False 表示退出主循环。
+    """
+    cmd = cmd.strip().lower()
+    if cmd in ("/quit", "/exit"):
+        print("[蓝] 👋 再见！")
+        return False, None
+    if cmd == "/help":
+        print(SLASH_HELP)
+        return True, None
+    if cmd == "/clear":
+        new_sess = Session()
+        print(f"[蓝] 🧹 已开启新 thread：{new_sess.thread_id}")
+        return True, new_sess
+    if cmd == "/new":
+        new_sess = Session()
+        print(f"[蓝] 🆕 新 thread：{new_sess.thread_id}")
+        return True, new_sess
+    if cmd == "/history":
+        cur = graph.get_state(sess.config)
+        vals = cur.values if cur else {}
+        print(f"[蓝] 当前 thread：{sess.thread_id}")
+        print(f"     已进行 {sess.round} 轮需求")
+        print(f"     图状态：next={list(cur.next) if cur and cur.next else '（已完成）'}")
+        if vals.get("plan"):
+            print(f"     最近计划：{json.dumps(vals['plan'], ensure_ascii=False)}")
+        if vals.get("review_rounds"):
+            print(f"     评审轮数：{vals['review_rounds']}")
+        return True, None
+    if cmd == "/graph":
+        print(graph.get_graph().draw_ascii())
+        return True, None
+    if cmd == "/resume":
+        sessions = list_sessions()
+        if not sessions:
+            print("[蓝] 暂无历史会话。")
+            return True, None
+        print("[蓝] 历史会话（最近在前）：")
+        for i, s in enumerate(sessions[:10], 1):
+            marker = " 👈 当前" if s["thread_id"] == sess.thread_id else ""
+            print(f"  {i}. {s['thread_id']}  轮次={s['rounds']}  最后活动={s['last_active']}{marker}")
+        choice = input("输入序号恢复，或回车取消 > ").strip()
+        if not choice:
+            return True, None
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                new_sess = Session(thread_id=sessions[idx]["thread_id"])
+                new_sess.round = sessions[idx]["rounds"]
+                print(f"[蓝] 🔁 已恢复 thread：{new_sess.thread_id}")
+                return True, new_sess
+            print("[蓝] 序号无效。")
+        except ValueError:
+            print("[蓝] 请输入数字。")
+        return True, None
+    print(f"[蓝] 未知命令 {cmd}，输入 /help 查看可用命令。")
+    return True, None
+
+
+# ─────────────────────────── 主交互循环 ───────────────────────────
 
 
 def _print_node(node_name: str, output: dict) -> None:
@@ -256,10 +423,11 @@ def _print_node(node_name: str, output: dict) -> None:
         print(f"\n[蓝] {output.get('feedback', '')}")
 
 
-def run_interactive(graph, request: str) -> None:
-    config = {"configurable": {"thread_id": "blue-single"}}
+def run_round(graph, sess: Session, request: str) -> None:
+    """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
+    config = sess.config
     state = initial_state(request)
-    print("[蓝] ★ 收到！开始干活。")
+    print(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。")
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -299,13 +467,60 @@ def run_interactive(graph, request: str) -> None:
                             print(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}")
                         else:
                             _print_node(node_name, output)
+    _save_session_meta(sess)
+
+
+def run_interactive(graph, request: str | None = None) -> None:
+    """多轮交互主循环：支持连续提需求 + 斜杠命令。"""
+    sess = Session()
+    if request:
+        run_round(graph, sess, request)
+    print("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。")
+    while True:
+        try:
+            line = input("\n> ").strip()
+        except EOFError:
+            print("\n[蓝] 👋 输入流关闭，退出。")
+            break
+        if not line:
+            continue
+        if line.startswith("/"):
+            cont, new_sess = handle_slash(line, sess, graph)
+            if not cont:
+                break
+            if new_sess is not None:
+                sess = new_sess
+            continue
+        run_round(graph, sess, line)
+
+
+def _resume_picker() -> str | None:
+    """启动时的 --resume 会话选择器。返回选中的 thread_id 或 None。"""
+    sessions = list_sessions()
+    if not sessions:
+        print("[蓝] 暂无历史会话可恢复。")
+        return None
+    print("[蓝] 历史会话（最近在前）：")
+    for i, s in enumerate(sessions[:10], 1):
+        print(f"  {i}. {s['thread_id']}  轮次={s['rounds']}  最后活动={s['last_active']}")
+    choice = input("输入序号恢复，或回车开启新会话 > ").strip()
+    if not choice:
+        return None
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(sessions):
+            return sessions[idx]["thread_id"]
+        print("[蓝] 序号无效，开启新会话。")
+    except ValueError:
+        print("[蓝] 输入无效，开启新会话。")
+    return None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="小蓝 Blue —— 本地个人 coding agent")
     parser.add_argument("request", nargs="?", default=None, help='要做的事，例如 "给 hello.py 加错误处理并写测试"')
     parser.add_argument("--show-graph", action="store_true", help="打印图拓扑后退出")
-    parser.add_argument("--resume", action="store_true", help="恢复上次会话（v0.2 实现）")
+    parser.add_argument("--resume", action="store_true", help="恢复历史会话")
     args = parser.parse_args()
 
     graph = build_graph()
@@ -313,10 +528,21 @@ def main() -> None:
         print(graph.get_graph().draw_ascii())
         return
     if args.resume:
-        print("--resume 为 v0.2 功能，暂未实现。")
-        return
-    request = args.request or input("> 你要我做什么？\n> ")
-    run_interactive(graph, request)
+        tid = _resume_picker()
+        if tid:
+            sess = Session(thread_id=tid)
+            # 恢复后先展示当前状态
+            cur = graph.get_state(sess.config)
+            if cur and cur.next:
+                print(f"[蓝] 恢复 thread {tid}，图处于等待状态：{list(cur.next)}")
+                # 如果有 pending interrupt，继续走审批循环
+                run_round(graph, sess, "")  # 空请求不会触发新 planner，直接检查 state
+            else:
+                print(f"[蓝] 恢复 thread {tid}，上轮已完成。输入新需求继续。")
+                run_interactive(graph)
+            return
+        # 用户取消或无效 → 落入新会话
+    run_interactive(graph, args.request)
 
 
 if __name__ == "__main__":
