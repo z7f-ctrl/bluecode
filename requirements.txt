@@ -1,0 +1,4 @@
+langgraph>=1.2
+langchain-openai>=1.4
+langchain-core>=1.5
+grandalf  # 仅 draw_ascii() 打印拓扑需要
