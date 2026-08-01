@@ -9,6 +9,10 @@ __pycache__/
 # 含硬编码 API key，不提交（轮换后如确认干净可移出）
 test2.py
 
+# 演示/学习脚本（不入库）
+hello.py
+test1.py
+
 # 环境/密钥（绝不入库）
 .env
 .env.*
