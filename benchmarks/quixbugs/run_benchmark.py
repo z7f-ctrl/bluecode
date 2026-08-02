@@ -134,6 +134,7 @@ def main() -> None:
     parser.add_argument("--algo", help="只跑指定算法")
     parser.add_argument("--dry-run", action="store_true", help="只列出任务不执行")
     parser.add_argument("--output", default=None, help="结果输出路径")
+    parser.add_argument("--workers", type=int, default=1, help="并行 worker 数（默认 1 串行）")
     args = parser.parse_args()
 
     tasks = [args.algo] if args.algo else list_tasks()
@@ -141,13 +142,26 @@ def main() -> None:
         print("无任务可跑")
         return
 
-    print(f"QuixBugs benchmark：{len(tasks)} 个任务")
+    print(f"QuixBugs benchmark：{len(tasks)} 个任务（workers={args.workers}）")
     results: list[dict] = []
-    for i, algo in enumerate(tasks, 1):
-        print(f"[{i}/{len(tasks)}] {algo} ... ", end="", flush=True)
-        r = run_single(algo, dry_run=args.dry_run)
-        results.append(r)
-        print(f"{r['status']} (pytest={r['pytest_status']}, {r['duration']}s)")
+    if args.workers <= 1 or args.dry_run:
+        for i, algo in enumerate(tasks, 1):
+            print(f"[{i}/{len(tasks)}] {algo} ... ", end="", flush=True)
+            r = run_single(algo, dry_run=args.dry_run)
+            results.append(r)
+            print(f"{r['status']} (pytest={r['pytest_status']}, {r['duration']}s)")
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        done = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(run_single, algo): algo for algo in tasks}
+            for fut in as_completed(futures):
+                r = fut.result()
+                results.append(r)
+                done += 1
+                print(f"[{done}/{len(tasks)}] {r['algo']} ... {r['status']} (pytest={r['pytest_status']}, {r['duration']}s)")
+        # 按任务名排序，保持输出稳定
+        results.sort(key=lambda r: r["algo"])
 
     # 汇总
     passed = sum(1 for r in results if r["status"] == "pass")
