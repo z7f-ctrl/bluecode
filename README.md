@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（9 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（10 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -38,25 +38,26 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 ## 它是怎么工作的
 
 ```
-用户请求 ──▶ planner（拆计划）──▶ agent（LLM+工具循环）──▶ guard（安全闸门）
-                                              ▲            │
-                                              │            ▼
-                                              │        verifier（自动验证）
-                                              │            │
-                                              │            ▼
-                                              │        reviewer（评审）
-                                              │            │
-                                              └──revise───  │ pass
-                                                            ▼
-                                                         report（交付）
+                 ┌─ 独立子任务≥2 → Send×N worker（并行，只读+暂存）─┐
+用户请求 ──▶ planner（拆计划）┤                                    ├──▶ guard（安全闸门）
+                 └─ 否则 → agent（LLM+工具循环）──────────────────┘        │
+                                              ▲                            ▼
+                                              │                        verifier（自动验证）
+                                              │                            │
+                                              │                        reviewer（评审）
+                                              │                            │
+                                              └──────────revise────────    │ pass
+                                                                           ▼
+                                                                        report（交付）
 ```
 
-六个节点（`agent.py`）：
+七个节点（`agent.py`）：
 
 | 节点 | 职责 |
 |---|---|
-| `planner` | 把需求拆成 3~6 步中文计划；简单需求（短、无多步骤词）跳过模型调用直接单步 |
+| `planner` | 把需求拆成 3~6 步中文计划；简单需求（短、无多步骤词）跳过模型调用直接单步；输出 `{steps, parallel_tasks}`，完全独立的子任务 ≥2 时走并行（上限 4 个） |
 | `agent` | 手写工具循环；只读工具直接执行，写/执行工具只**暂存**到 `pending_changes`，不真动手；`final_answer` 显式终止 |
+| `worker` | 并行 worker（v0.5）：处理派发的一个独立子任务，只读+暂存不执行，产出经 reducer 聚合到 guard 一次审批 |
 | `guard` | 有待审批改动时 `interrupt()` 冻结图，等你 `y`/`n`/`m`；通过才真正执行；`--auto-approve` 模式下自动放行 |
 | `verifier` | 审批通过后自动验证：`py_compile` 语法检查改动文件 + 自动发现并跑 pytest（最多 3 个文件，30s 超时），结果追加到 feedback |
 | `reviewer` | 自审：`verdict: pass / revise`，revise 弹回 agent 重改（上限 3 轮）；判定有 verifier 的客观验证结果做依据 |
@@ -72,10 +73,13 @@ class AgentState(TypedDict):
     request: str                              # 原始需求
     plan: list[str]                           # planner 拆出的步骤
     current_step: int                         # 当前执行步
-    pending_changes: list[dict]               # 待审批改动 [{action, ...}]
+    pending_changes: list[dict]               # 待审批改动 [{action, ...}]（reducer 聚合：空=清空，非空=追加）
     review_rounds: int                        # 自审轮数（上限 3）
     verdict: str                              # pass / revise / proceed / rejected / approved
     feedback: str                             # 评审意见 / 执行结果 / 自动验证结果
+    parallel_tasks: list[str]                 # planner 拆出的可并行子任务（空 = 走串行）
+    current_subtask: str                      # Send 注入给单个 worker 的子任务
+    worker_notes: list[str]                   # 各并行 worker 的一句话总结（reducer 聚合）
 ```
 
 ## 工具集（`tools.py`）
@@ -113,16 +117,16 @@ BLUE_COMMAND_WHITELIST=python3,pytest,ls,cat
 
 ```
 bluecode/
-├── agent.py            # 状态、节点、建图、CLI、step 回调机制（~780 行）
+├── agent.py            # 状态、节点、建图、CLI、step 回调机制（~950 行）
 ├── tools.py            # 8 工具 + 安全校验（命令/Python 双路径）
-├── prompts.py          # planner / agent / reviewer / report 提示词（文案集中）
-├── validate_graph.py   # 离线功能验证（fake model，9 项，不需 API key）
+├── prompts.py          # planner / agent / worker / reviewer / report 提示词（文案集中）
+├── validate_graph.py   # 离线功能验证（fake model，10 项，不需 API key）
 ├── requirements.txt
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
 ├── design.md           # v0.1 设计稿（历史文档，实现已演进超出）
 └── benchmarks/
-    └── quixbugs/       # QuixBugs 修 bug 基准（31 题，见 README）
+    └── quixbugs/       # QuixBugs 修 bug 基准（40 题 = 31 简单 + 9 图算法，见 README）
         ├── prepare.py        # 题库提取
         ├── run_benchmark.py  # 基准 runner
         └── README.md
@@ -133,8 +137,8 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 9 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
-# 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过
+# 离线 10 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -143,13 +147,14 @@ python validate_graph.py
 
 ## Benchmark（QuixBugs）
 
-内置 [QuixBugs](https://github.com/jkoppel/QuixBugs) 31 个算法修 bug 题作为能力评测：
+内置 [QuixBugs](https://github.com/jkoppel/QuixBugs) 40 个算法修 bug 题作为能力评测（31 个简单题 + 9 个依赖 `node.py` 的图/链表题）：
 
 ```bash
 git clone --depth 1 https://github.com/jkoppel/QuixBugs.git /tmp/quixbugs-src
 python3 benchmarks/quixbugs/prepare.py                 # 生成题库
-python3 benchmarks/quixbugs/run_benchmark.py           # 全量 31 题
+python3 benchmarks/quixbugs/run_benchmark.py           # 全量 40 题
 python3 benchmarks/quixbugs/run_benchmark.py --algo gcd  # 单题冒烟
+python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 ```
 
 详见 `benchmarks/quixbugs/README.md`。
@@ -163,9 +168,10 @@ python3 benchmarks/quixbugs/run_benchmark.py --algo gcd  # 单题冒烟
 | v0.2.5 | reviewer 风格收敛（去毒舌人设）+ planner 条件化 + verifier 自动验证节点 | ✅ 已实现 |
 | v0.3 | 借鉴 smolagents：`final_answer` 显式终止 + 命令白名单 + `plan_run_python` 受限沙箱 + step 回调注册机制 | ✅ 已实现 |
 | v0.4 | QuixBugs benchmark（31 题修 bug 判分）+ `--auto-approve` 模式 | ✅ 已实现 |
-| v0.5 | 多文件并行修改（`Send`），评审意见按文件分发 | 未实现 |
+| v0.4.5 | reviewer 判定 fail-closed + 判分管线修复 + benchmark 扩至 40 题（+9 图算法）+ runner 并行 | ✅ 已实现 |
+| v0.5 | 多文件并行修改：`Send` 扇出 worker + reducer 聚合 + 一次性审批 | ✅ 已实现 |
 | v0.6 | LangGraph Studio 可视化调试 | 未实现 |
-| v0.7 | 基准扩展：9 个图算法题接入、FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy | 未实现 |
+| v0.7 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 
 ## 安全说明（重要）
 
