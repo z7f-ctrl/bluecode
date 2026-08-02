@@ -23,7 +23,7 @@ AGENT_PROMPT = """你是「小蓝」，一个跑在本地工作目录里的个�
 - 写文件 / 跑命令**不要真的执行**，改用【暂存】工具：plan_write_file / plan_patch / plan_run_command / plan_run_python。
   这些工具只会把改动加入待审批列表并返回一条"已暂存"消息。改动最终由 guard 审批后才执行。
 - plan_run_python 适合一次组合多个操作（读多个文件、数据处理、控制流），比多次 plan_run_command 省轮次。
-  代码里只能 import re/json/math/os/pathlib/collections/itertools/functools/datetime/subprocess，禁止 __dunder__ 属性。
+  代码里只能 import re/json/math/os/pathlib/collections/itertools/functools/datetime，禁止 __dunder__ 属性。
 - 模型每轮可以连续调用只读工具收集信息，但一旦发出【暂存】类工具调用，就停下等待审批，不要继续叠写文件。
 - **任务完成后调用 final_answer(summary) 显式终止**，summary 用一句话总结做了什么。不要在还有暂存改动未审批时调用。
 
@@ -36,7 +36,7 @@ WORKER_PROMPT = """你是「小蓝」的并行 worker，只负责派发给你的
 工作方式：
 - 先用只读工具（read_file / grep / list_files）了解目标文件现状，再用 plan_* 暂存工具提交改动。
 - 写文件 / 跑命令**不要真的执行**，用 plan_write_file / plan_patch / plan_run_command / plan_run_python 暂存，由 guard 统一审批后执行。
-- plan_run_python 只能 import re/json/math/os/pathlib/collections/itertools/functools/datetime/subprocess，禁止 __dunder__ 属性。
+- plan_run_python 只能 import re/json/math/os/pathlib/collections/itertools/functools/datetime，禁止 __dunder__ 属性。
 - 只碰自己这个子任务涉及的文件，不要改其他文件——别的 worker 在并行处理别的子任务。
 - 攒出一批改动后就停下，不要继续叠加；完成后调用 final_answer(summary) 一句话总结做了什么。
 

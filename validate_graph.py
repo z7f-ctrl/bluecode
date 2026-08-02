@@ -390,6 +390,37 @@ def test_parallel_workers_fanout():
                 os.remove(f)
 
 
+def test_security_hardening():
+    """纵深防御加固：命令复合符 / subprocess import / getattr dunder 逃逸。"""
+    from tools import _execute_python, check_command_safety, check_python_safety
+
+    # 1. 复合命令/命令替换全拦（此前 ls && rm x 能过：黑名单只查整串关键词）
+    for bad in ["ls && rm important.py", "cat a.txt; rm b.py", "echo $(whoami)", "cat `id`"]:
+        try:
+            check_command_safety(bad)
+            raise AssertionError(f"应拦截但未拦：{bad}")
+        except ValueError:
+            pass
+    check_command_safety("python3 -m pytest test_x.py -v")  # 正常单命令不受影响
+
+    # 2. subprocess 移出 import 白名单（此前 subprocess.run 绕过命令校验）
+    try:
+        check_python_safety("import subprocess")
+        raise AssertionError("应拦截 import subprocess")
+    except ValueError:
+        pass
+
+    # 3. getattr/setattr 的 dunder 字符串参数运行时被拦（ast 只看属性节点，看不到字符串）
+    r = _execute_python("print(getattr(str, '__class__'))")
+    assert "执行失败" in r and "dunder" in r, f"getattr dunder 应被运行时拦截，实际：{r}"
+    r = _execute_python("setattr(str, '__x__', 1)")
+    assert "执行失败" in r and "dunder" in r, f"setattr dunder 应被运行时拦截，实际：{r}"
+    # 正常 getattr 不受影响
+    r = _execute_python("print(getattr('abc', 'upper')())")
+    assert "ABC" in r, f"正常 getattr 应可用，实际：{r}"
+    print("PASS security hardening（&& ; $() 反引号 / subprocess / getattr+setattr dunder）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -402,6 +433,7 @@ if __name__ == "__main__":
         test_revise_compresses_messages()
         test_skip_planner_for_simple_request()
         test_parallel_workers_fanout()
+        test_security_hardening()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

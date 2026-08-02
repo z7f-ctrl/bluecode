@@ -29,6 +29,13 @@ _BLOCKED_COMMAND_PATTERNS = [
     re.compile(r"\brm\s+/\b"),         # 删根
     re.compile(r"\bsudo\b"),           # 提权
     re.compile(r"\|"),                 # shell 管道（高危组合）
+    # 复合命令 / 命令替换：ls && rm x、echo $(rm x)、cat `rm x` 会把第二段命令
+    # 藏进一条"看起来安全"的命令里（黑名单只查整串关键词、白名单只查命令头，
+    # 第二段完全失控）。与管道同级处理：禁复合命令，多步操作拆多次暂存。
+    re.compile(r"&&"),
+    re.compile(r";"),
+    re.compile(r"\$\("),
+    re.compile(r"`"),
 ]
 
 _DEFAULT_TIMEOUT = 60  # 命令默认超时（秒）
@@ -179,7 +186,10 @@ import contextlib
 
 _PYTHON_ALLOWED_IMPORTS = {
     "re", "json", "math", "os", "pathlib", "collections", "itertools",
-    "functools", "datetime", "subprocess",
+    "functools", "datetime",
+    # subprocess 已移除：subprocess.run("rm x") 可完全绕过 check_command_safety，
+    # 要跑命令必须走 plan_run_command 接受完整校验链。os 保留（os.path 等刚需），
+    # os.system 理论上同类风险——沙箱是纵深防御一层，最终门槛是 guard 人工审批。
 }
 _PYTHON_MAX_OPERATIONS = 100_000  # ast 节点数上限，防巨型代码
 _PYTHON_TIMEOUT = 30  # 秒
@@ -228,8 +238,8 @@ def check_python_safety(code: str) -> None:
 def plan_run_python(code: str) -> str:
     """【暂存】计划在工作目录内执行一段 Python 代码。不会真的执行，需要审批。
     适用：一次组合多个文件操作/数据处理/控制流，比多次 plan_run_command 省轮次。
-    限制：仅可导入 re/json/math/os/pathlib/collections/itertools/functools/datetime/subprocess，
-    禁止 __dunder__ 属性访问，30s 超时，输出截断 3000 字符。"""
+    限制：仅可导入 re/json/math/os/pathlib/collections/itertools/functools/datetime，
+    禁止 __dunder__ 属性访问（含 getattr/setattr 的字符串形式），30s 超时，输出截断 3000 字符。"""
     check_python_safety(code)
     return f"plan_run_python(code_len={len(code)}) 已暂存——等待审批。"
 
@@ -243,22 +253,45 @@ def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     return _b.__import__(name, globals, locals, fromlist, level)
 
 
+def _safe_getattr(obj, name, *default):
+    """getattr 包装：拦截 dunder 字符串参数。
+
+    ast 检查只看 ast.Attribute 节点的属性名，看不到 getattr(obj, '__class__')
+    这种字符串参数——经典逃逸链 getattr(getattr(o,'__class__'),'__subclasses__')()
+    全靠它。必须在运行时拦。
+    """
+    if isinstance(name, str) and name.startswith("__"):
+        raise ValueError(f"禁止 getattr 访问 dunder 属性 {name!r}")
+    import builtins as _b
+    return _b.getattr(obj, name, *default)
+
+
+def _safe_setattr(obj, name, value):
+    """setattr 包装：同理拦截 dunder 字符串参数。"""
+    if isinstance(name, str) and name.startswith("__"):
+        raise ValueError(f"禁止 setattr 访问 dunder 属性 {name!r}")
+    import builtins as _b
+    return _b.setattr(obj, name, value)
+
+
 def _restricted_builtins() -> dict:
     """受限 builtins：保留常用安全函数 + 受限 __import__，剔除 open/eval/exec。"""
     import builtins as _b
 
     safe_names = [
         "abs", "all", "any", "bin", "bool", "chr", "dict", "dir", "divmod",
-        "enumerate", "filter", "float", "format", "frozenset", "getattr",
+        "enumerate", "filter", "float", "format", "frozenset",
         "hasattr", "hash", "hex", "int", "isinstance", "issubclass", "iter",
         "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
-        "print", "range", "repr", "reversed", "round", "set", "setattr",
+        "print", "range", "repr", "reversed", "round", "set",
         "slice", "sorted", "str", "sum", "tuple", "type", "zip", "Exception",
         "ValueError", "TypeError", "KeyError", "IndexError", "StopIteration",
         "True", "False", "None",
     ]
     d = {n: getattr(_b, n) for n in safe_names if hasattr(_b, n)}
     d["__import__"] = _restricted_import
+    # getattr/setattr 换成包装版：拦 dunder 字符串参数（ast 检查看不到字符串）
+    d["getattr"], d["setattr"] = _safe_getattr, _safe_setattr
     return d
 
 
