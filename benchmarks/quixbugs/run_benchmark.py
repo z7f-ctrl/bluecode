@@ -26,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 TASKS_DIR = ROOT / "tasks"
 RESULTS_DIR = ROOT / "results"
+AGENT_PY = ROOT.parents[1] / "agent.py"  # 项目根目录的 agent.py，避免硬编码绝对路径
 
 # 超时配置（秒）
 AGENT_TIMEOUT = 120  # agent 单题最大运行时间
@@ -68,6 +69,18 @@ def setup_task_workdir(algo: str) -> Path:
     for f in src.iterdir():
         if f.is_file() and f.suffix in (".py", ".json"):
             shutil.copy(f, workdir / f.name)
+    # 兜底 conftest.py：QuixBugs 部分测试（knapsack）引用 pytest.run_slow /
+    # use_correct，原仓库由根目录 conftest 的 pytest_configure 提供，prepare.py
+    # 不会复制它，缺了直接 AttributeError——修对也判 fail。
+    conftest = workdir / "conftest.py"
+    if not conftest.exists():
+        conftest.write_text(
+            "import pytest\n\n\n"
+            "def pytest_configure(config):\n"
+            "    pytest.use_correct = False\n"
+            "    pytest.run_slow = False\n",
+            encoding="utf-8",
+        )
     return workdir
 
 
@@ -90,15 +103,19 @@ def run_single(algo: str, *, dry_run: bool = False) -> dict:
     try:
         # 用 subprocess 调 agent.py，工作目录设为任务目录
         # --auto-approve 让 guard 自动通过（benchmark 模式）
+        # prompt 针对实测踩坑设计：幻觉 cd 路径、不读代码先跑 pytest 白耗轮次
         request = (
-            f"当前目录下的 buggy.py 是算法 {algo} 的带 bug 实现，"
-            f"同目录有测试文件 test_{algo}.py。"
-            f"请阅读 buggy.py 找出并修复 bug（用 plan_patch 局部修改），"
-            f"使测试通过。不要修改测试文件。"
+            f"当前工作目录就是任务目录，用相对路径操作文件即可，不要 cd 到任何其他路径。"
+            f"buggy.py 是算法 {algo} 的带 bug 实现，test_{algo}.py 是对应测试。"
+            f"请严格按顺序执行："
+            f"1) 用 read_file 读 buggy.py 和 test_{algo}.py；"
+            f"2) 定位 bug，用 plan_patch 对 buggy.py 做局部修复；"
+            f"3) 不要自己跑 pytest——改动通过审批后系统会自动跑测试并把结果反馈给你。"
+            f"不要修改测试文件。"
         )
         proc = subprocess.run(
             [
-                sys.executable, "/Users/yiqizhi/code/bluecode/agent.py",
+                sys.executable, str(AGENT_PY),
                 request,
                 "--auto-approve",
             ],
