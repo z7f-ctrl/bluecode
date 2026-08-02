@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import traceback
 import uuid
@@ -853,6 +854,44 @@ def _setup_file_logging() -> None:
     register_step_callback(_file_log_callback)
 
 
+# ─────────────────────────── 终端颜色（ANSI，无依赖） ───────────────────────────
+# 仅交互 TTY 启用：管道/重定向（benchmark 子进程 capture_output、results/*.log）自动无色。
+# 尊重 NO_COLOR 惯例（https://no-color.org/）：设置即禁用。
+
+_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+class _C:
+    """ANSI 颜色码；无颜色环境全部是空串。"""
+    BLUE = "\033[94m" if _USE_COLOR else ""        # [蓝] 普通播报
+    CYAN = "\033[36m" if _USE_COLOR else ""        # worker / 次级播报
+    GREEN = "\033[32m" if _USE_COLOR else ""       # 放行 / 成功
+    YELLOW = "\033[33m" if _USE_COLOR else ""      # 待审批 / 打回（需要用户注意）
+    RED = "\033[31m" if _USE_COLOR else ""         # 错误
+    BRIGHT_CYAN = "\033[96m" if _USE_COLOR else ""  # 用户输入提示符
+    DIM = "\033[2m" if _USE_COLOR else ""          # 自动模式播报
+    RESET = "\033[0m" if _USE_COLOR else ""
+
+
+def _c(text: str, color: str) -> str:
+    """着色；无颜色环境原样返回。"""
+    return f"{color}{text}{_C.RESET}" if _USE_COLOR else text
+
+
+# input() 提示符着色：GNU readline / libedit 需要 \001\002 包围不可见字符，
+# 否则长输入换行时光标位置算错。无 readline 的环境裸用 ANSI 即可。
+try:
+    import readline as _readline  # noqa: F401 — 顺带启用行编辑/历史（易用性）
+    _P1, _P2 = "\001", "\002"
+except ImportError:
+    _P1, _P2 = "", ""
+
+
+def _prompt(text: str, color: str) -> str:
+    """input() 用的着色提示符（readline 安全）。"""
+    return f"{_P1}{color}{_P2}{text}{_P1}{_C.RESET}{_P2}" if _USE_COLOR else text
+
+
 def _print_pending(prefix: str, changes: list[dict]) -> None:
     """打印暂存的改动清单（agent 与 worker 共用）。"""
     for c in changes:
@@ -869,38 +908,43 @@ def _print_node(node_name: str, output: dict) -> None:
         plan = output.get("plan", [])
         parallel = output.get("parallel_tasks") or []
         if len(parallel) >= 2:
-            print(f"[蓝] 拆出 {len(parallel)} 个独立子任务，并行 worker 处理：{json.dumps(parallel, ensure_ascii=False)}")
+            print(_c(f"[蓝] 拆出 {len(parallel)} 个独立子任务，并行 worker 处理：{json.dumps(parallel, ensure_ascii=False)}", _C.BLUE))
         # planner 条件化：单步且与需求原文一致 → 简单需求直接执行
         elif len(plan) == 1:
-            print("[蓝] 简单需求，直接执行")
+            print(_c("[蓝] 简单需求，直接执行", _C.BLUE))
         else:
-            print(f"[蓝] 计划：{json.dumps(plan, ensure_ascii=False)}")
+            print(_c(f"[蓝] 计划：{json.dumps(plan, ensure_ascii=False)}", _C.BLUE))
     elif node_name == "agent" and output.get("pending_changes"):
-        _print_pending("[蓝]", output["pending_changes"])
+        _print_pending(_c("[蓝]", _C.BLUE), output["pending_changes"])
     elif node_name == "worker":
-        _print_pending("[蓝·worker]", output.get("pending_changes", []))
+        _print_pending(_c("[蓝·worker]", _C.CYAN), output.get("pending_changes", []))
         for note in output.get("worker_notes", []):
-            print(f"[蓝·worker] {note}")
+            print(_c(f"[蓝·worker] {note}", _C.CYAN))
     elif node_name == "guard":
-        print(f"[蓝] 审批结果：{output.get('verdict')}")
+        print(_c(f"[蓝] 审批结果：{output.get('verdict')}", _C.BLUE))
     elif node_name == "verifier":
         fb = output.get("feedback", "")
         if "【自动验证结果】" in fb:
-            # 只打印验证部分，不重复执行结果
+            # 只打印验证部分，不重复执行结果；✗ 红 ✓ 绿，扫一眼即知
             verify_part = fb.split("【自动验证结果】")[-1].strip()
-            print(f"[蓝] 🔍 自动验证：{verify_part}")
+            colored = [
+                _c(ln, _C.RED) if "✗" in ln else _c(ln, _C.GREEN) if "✓" in ln else ln
+                for ln in verify_part.split("\n")
+            ]
+            print(_c("[蓝] 🔍 自动验证：", _C.BLUE) + "\n".join(colored))
     elif node_name == "reviewer":
-        mark = "✅ 放行" if output.get("verdict") == "pass" else "🔪 打回"
-        print(f"[评审] {mark}｜{output.get('feedback', '')}")
+        passed = output.get("verdict") == "pass"
+        mark = "✅ 放行" if passed else "🔪 打回"
+        print(_c(f"[评审] {mark}｜{output.get('feedback', '')}", _C.GREEN if passed else _C.YELLOW))
     elif node_name == "report":
-        print(f"\n[蓝] {output.get('feedback', '')}")
+        print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BLUE))
 
 
 def run_round(graph, sess: Session, request: str) -> None:
     """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
     config = sess.config
     state = initial_state(request)
-    print(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。")
+    print(_c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE))
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -916,29 +960,29 @@ def run_round(graph, sess: Session, request: str) -> None:
         for task in cur.tasks:
             if task.interrupts:
                 payload = task.interrupts[0].value
-                print("\n[蓝] ⏸ 等待你审批：")
+                print(_c("\n[蓝] ⏸ 等待你审批：", _C.YELLOW))
                 for ci, ch in enumerate(payload.get("changes", []), 1):
                     shown = {k: v for k, v in ch.items() if k != "action"}
-                    print(f"  {ci}. [{ch['action']}] {json.dumps(shown, ensure_ascii=False)}")
+                    print(_c(f"  {ci}. [{ch['action']}] {json.dumps(shown, ensure_ascii=False)}", _C.YELLOW))
 
                 def ask(prompt: str) -> str:
                     try:
                         return input(prompt).strip().lower()
                     except EOFError:
-                        print("\n[蓝] ⏹ 输入流已关闭，按「拒绝」安全中止。")
+                        print(_c("\n[蓝] ⏹ 输入流已关闭，按「拒绝」安全中止。", _C.RED))
                         return "n"
 
-                choice = ask("[y]允许 [n]拒绝 [m]修改意见 > ")
+                choice = ask(_prompt("[y]允许 [n]拒绝 [m]修改意见 > ", _C.BRIGHT_CYAN))
                 resume_val = {"action": "approve"}
                 if choice == "n":
-                    resume_val = {"action": "reject", "note": ask("  拒绝原因(可空) > ") or "用户拒绝"}
+                    resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
                 elif choice == "m":
-                    resume_val = {"action": "modify", "note": ask("  修改意见 > ")}
+                    resume_val = {"action": "modify", "note": ask(_prompt("  修改意见 > ", _C.BRIGHT_CYAN))}
                 print()
                 for chunk in graph.stream(Command(resume=resume_val), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
                         if node_name == "guard" and output.get("verdict") == "approved":
-                            print(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}")
+                            print(_c(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}", _C.GREEN))
                         else:
                             _emit_step(node_name, output)
     _save_session_meta(sess)
@@ -950,12 +994,12 @@ def run_interactive(graph, request: str | None = None) -> None:
     sess = Session()
     if request:
         run_round(graph, sess, request)
-    print("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。")
+    print(_c("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
     while True:
         try:
-            line = input("\n> ").strip()
+            line = input(_prompt("\n> ", _C.BRIGHT_CYAN)).strip()
         except EOFError:
-            print("\n[蓝] 👋 输入流关闭，退出。")
+            print(_c("\n[蓝] 👋 输入流关闭，退出。", _C.BLUE))
             break
         if not line:
             continue
@@ -1032,7 +1076,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
     """benchmark 模式：单轮执行，guard 自动 approve 不中断。"""
     config = sess.config
     state = initial_state(request)
-    print(f"[蓝] ★ benchmark 模式收到：{request}")
+    print(_c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE))
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -1048,7 +1092,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
             break
         for task in cur.tasks:
             if task.interrupts:
-                print("[蓝] ⏸ 自动审批通过")
+                print(_c("[蓝] ⏸ 自动审批通过", _C.DIM))
                 for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
                         _emit_step(node_name, output)

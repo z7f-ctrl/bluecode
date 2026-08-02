@@ -203,6 +203,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 
 可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume`。
 
+交互界面带颜色区分：用户输入提示符 `>`（亮青）、[蓝] 播报（蓝）、[蓝·worker]（青）、放行/成功（绿）、待审批/打回（黄）、验证失败行（红）。仅真实终端启用——管道/重定向（benchmark 子进程）自动无色；设 `NO_COLOR=1` 可强制关闭（遵循 no-color.org 惯例）。`input()` 提示符的 ANSI 码用 `\001\002` 包围（readline 光标安全），并自动启用 readline 行编辑/历史。
+
 会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。
 
 ## 扩展：step 回调
