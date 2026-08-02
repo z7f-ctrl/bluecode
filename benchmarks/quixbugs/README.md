@@ -21,7 +21,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --dry-run          # 只列出任�
 - 每题独立 workdir，agent 以 `--auto-approve` 模式修 `buggy.py`（单题 180s 超时）
 - 修完后跑 `pytest test_<algo>.py`，带 15s 超时（防死循环 bug）
 - 结果：`pass`（全过）/ `fail`（测试失败）/ `agent-timeout` / `agent-error`
-- 输出 resolve rate，详细结果存 `results/run-<timestamp>.json`
+- 输出 resolve rate，详细结果存 `results/run-<timestamp>.json`（尾部摘要+路径），**完整输出落盘同名目录** `results/run-<timestamp>/<algo>.agent.log|.pytest.log`（含 agent 超时时的部分输出）
 - workdir 自动补 `conftest.py`（knapsack 等测试引用 `pytest.run_slow`/`use_correct`，原仓库靠根 conftest 提供，缺失会 AttributeError 误判 fail）
 
 ## 任务结构

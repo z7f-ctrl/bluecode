@@ -214,3 +214,14 @@ agent.register_step_callback(lambda node, output: my_ui.render(node, output))
 ```
 
 回调异常不阻断主流程；`agent.clear_step_callbacks()` 可清空。
+
+## 日志
+
+两层文件日志，都在 `~/.blue/logs/`（本地，不入库）：
+
+| 日志 | 开启方式 | 内容 |
+|---|---|---|
+| `blue-<date>.log` | 默认开启（CLI 启动时挂载） | 节点事件摘要：verdict、暂存清单、评审轮数、异常堆栈 |
+| `blue-llm-<date>.log` | `BLUE_LOG_LLM=1`（环境变量或 .env） | 每次 LLM 调用全文：caller、请求摘要、响应全文、finish_reason、token usage、耗时 |
+
+benchmark 的完整输出另存 `benchmarks/quixbugs/results/run-<ts>/<algo>.agent.log|.pytest.log`（json 里只存尾部摘要+路径）。

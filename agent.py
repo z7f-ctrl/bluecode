@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sqlite3
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -139,6 +141,70 @@ def _make_plain_model() -> ChatOpenAI:
     return _plain_model_cache
 
 
+# ─────────────────────────── 文件日志（节点事件 + 可选 LLM 全文） ───────────────────────────
+# 两层，都落 ~/.blue/logs/（本地，不入库）：
+# - 节点日志 blue-<date>.log：节点输出摘要 + 异常，CLI 启动时经 step 回调挂载
+# - LLM 日志 blue-llm-<date>.log：BLUE_LOG_LLM=1 时记录每次调用的请求摘要、
+#   响应全文、finish_reason、token usage、耗时（功能调试 + 性能分析用）
+
+LOG_DIR = os.path.join(BLUE_DIR, "logs")
+
+
+def _get_logger(name: str, filename: str) -> logging.Logger:
+    """懒创建文件 logger：首次使用才建目录/文件。多进程并发写同一文件时
+    长行可能交错（benchmark 并行子进程场景），可读性受损但不丢数据。"""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = logging.FileHandler(os.path.join(LOG_DIR, filename), encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger
+
+
+def _node_logger() -> logging.Logger:
+    return _get_logger("blue.node", f"blue-{datetime.now():%Y%m%d}.log")
+
+
+def _llm_logger() -> logging.Logger:
+    return _get_logger("blue.llm", f"blue-llm-{datetime.now():%Y%m%d}.log")
+
+
+def _llm_log_enabled() -> bool:
+    return os.environ.get("BLUE_LOG_LLM", "").lower() in ("1", "true", "yes", "on")
+
+
+def _logged_invoke(model: ChatOpenAI, messages: list, caller: str):
+    """model.invoke 的观测包装：BLUE_LOG_LLM=1 时落 LLM 全文日志。"""
+    t0 = time.monotonic()
+    resp = model.invoke(messages)
+    if _llm_log_enabled():
+        duration = time.monotonic() - t0
+        lines = [f"=== {caller} ({duration:.1f}s) ==="]
+        for m in messages:
+            role = getattr(m, "type", "?")
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            line = f"<{role}> {content[:300]}"
+            tcs = getattr(m, "tool_calls", None)
+            if tcs:
+                line += f" tool_calls={json.dumps(tcs, ensure_ascii=False)[:300]}"
+            lines.append(line)
+        out = resp.content if isinstance(resp.content, str) else str(resp.content)
+        lines.append(f"--> {out}")
+        if getattr(resp, "tool_calls", None):
+            lines.append(f"--> tool_calls={json.dumps(resp.tool_calls, ensure_ascii=False)}")
+        meta = getattr(resp, "response_metadata", None) or {}
+        usage = meta.get("token_usage") or {}
+        lines.append(
+            f"--> finish={meta.get('finish_reason')} "
+            f"tokens={usage.get('prompt_tokens')}/{usage.get('completion_tokens')}"
+        )
+        _llm_logger().info("\n".join(lines))
+    return resp
+
+
 def should_skip_planner(request: str) -> bool:
     """判断需求是否简单到不需要 planner 拆解。"""
     # 一句话能说完、无多文件/多步骤迹象的需求直接进 agent
@@ -155,8 +221,10 @@ def planner(state: AgentState) -> dict:
     if should_skip_planner(state["request"]):
         return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed",
                 "parallel_tasks": [], "worker_notes": []}
-    resp = _make_plain_model().invoke(
-        [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])]
+    resp = _logged_invoke(
+        _make_plain_model(),
+        [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])],
+        "planner",
     )
     content = resp.content
     plan: list | None = None
@@ -203,7 +271,7 @@ def agent(state: AgentState) -> dict:
 
     while iterations < MAX_TOOL_ITERATIONS:
         iterations += 1
-        ai: AIMessage = _make_model().invoke(messages)
+        ai: AIMessage = _logged_invoke(_make_model(), messages, "agent")
         messages.append(ai)
         updated.append(ai)
         if not ai.tool_calls:
@@ -287,7 +355,7 @@ def worker(state: AgentState) -> dict:
     pending: list[dict] = []
 
     for _ in range(MAX_WORKER_ITERATIONS):
-        ai: AIMessage = _make_model().invoke(messages)
+        ai: AIMessage = _logged_invoke(_make_model(), messages, "worker")
         messages.append(ai)
         if not ai.tool_calls:
             break
@@ -478,7 +546,8 @@ def reviewer(state: AgentState) -> dict:
     if verdict == "proceed":
         return {"verdict": "pass", "feedback": "本次为只读任务，无需改动。", "review_rounds": rounds + 1}
 
-    resp = _make_plain_model().invoke(
+    resp = _logged_invoke(
+        _make_plain_model(),
         [
             SystemMessage(content=REVIEWER_PROMPT),
             HumanMessage(
@@ -488,7 +557,8 @@ def reviewer(state: AgentState) -> dict:
                     f"本次执行结果：\n{state.get('feedback', '(无)')}"
                 )
             ),
-        ]
+        ],
+        "reviewer",
     )
     text = resp.content if isinstance(resp.content, str) else str(resp.content)
     m = re.search(r"\bverdict\s*[:：]?\s*(pass|revise)\b", text, re.IGNORECASE)
@@ -516,7 +586,8 @@ def reviewer(state: AgentState) -> dict:
 
 
 def report(state: AgentState) -> dict:
-    resp = _make_plain_model().invoke(
+    resp = _logged_invoke(
+        _make_plain_model(),
         [
             SystemMessage(content=REPORT_PROMPT),
             HumanMessage(
@@ -527,7 +598,8 @@ def report(state: AgentState) -> dict:
                     f"执行/测试结果：{state.get('feedback', '(无)')}"
                 )
             ),
-        ]
+        ],
+        "report",
     )
     return {"feedback": resp.content if isinstance(resp.content, str) else str(resp.content)}
 
@@ -751,6 +823,36 @@ def _emit_step(node_name: str, output: dict) -> None:
             pass
 
 
+def _summarize_output(output: dict) -> str:
+    """节点输出压缩成单行摘要，供节点文件日志。"""
+    parts: list[str] = []
+    if output.get("verdict"):
+        parts.append(f"verdict={output['verdict']}")
+    if output.get("pending_changes"):
+        actions = ",".join(c.get("action", "?") for c in output["pending_changes"])
+        parts.append(f"pending={len(output['pending_changes'])}({actions})")
+    if output.get("parallel_tasks"):
+        parts.append(f"parallel={len(output['parallel_tasks'])}")
+    if output.get("worker_notes"):
+        parts.append(f"notes={len(output['worker_notes'])}")
+    if "review_rounds" in output:
+        parts.append(f"rounds={output['review_rounds']}")
+    if output.get("feedback"):
+        fb = str(output["feedback"]).replace("\n", " ")[:200]
+        parts.append(f"feedback={fb!r}")
+    return " ".join(parts) or "(empty)"
+
+
+def _file_log_callback(node_name: str, output: dict) -> None:
+    """step 回调：节点输出写文件日志（CLI 启动时挂载）。"""
+    _node_logger().info("[%s] %s", node_name, _summarize_output(output))
+
+
+def _setup_file_logging() -> None:
+    """CLI 入口调用：注册节点文件日志回调。测试不调 main()，不写文件。"""
+    register_step_callback(_file_log_callback)
+
+
 def _print_pending(prefix: str, changes: list[dict]) -> None:
     """打印暂存的改动清单（agent 与 worker 共用）。"""
     for c in changes:
@@ -805,6 +907,7 @@ def run_round(graph, sess: Session, request: str) -> None:
                 _emit_step(node_name, output)
     except Exception:
         traceback.print_exc()
+        _node_logger().exception("run_round 图执行异常（thread=%s）", sess.thread_id)
 
     while True:
         cur = graph.get_state(config)
@@ -896,6 +999,7 @@ def main() -> None:
     parser.add_argument("--auto-approve", action="store_true", help="benchmark 模式：guard 自动审批通过，不中断等待人工")
     args = parser.parse_args()
 
+    _setup_file_logging()
     graph = build_graph()
     if args.show_graph:
         print(graph.get_graph().draw_ascii())
@@ -935,6 +1039,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
                 _emit_step(node_name, output)
     except Exception:
         traceback.print_exc()
+        _node_logger().exception("run_round_auto 图执行异常（thread=%s）", sess.thread_id)
 
     # 自动审批所有 interrupt
     while True:

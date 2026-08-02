@@ -84,8 +84,9 @@ def setup_task_workdir(algo: str) -> Path:
     return workdir
 
 
-def run_single(algo: str, *, dry_run: bool = False) -> dict:
-    """跑一个任务。返回结果 dict。"""
+def run_single(algo: str, *, dry_run: bool = False, log_dir: Path | None = None) -> dict:
+    """跑一个任务。返回结果 dict。log_dir 非空时把完整 agent/pytest 输出落盘
+    （json 里只存尾部摘要——之前只存截断文本，超时题的现场完全丢失）。"""
     workdir = setup_task_workdir(algo)
     result: dict = {
         "algo": algo,
@@ -98,6 +99,14 @@ def run_single(algo: str, *, dry_run: bool = False) -> dict:
     if dry_run:
         result["status"] = "dry-run"
         return result
+
+    def _write_log(kind: str, text: str) -> None:
+        if log_dir is None:
+            return
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / f"{algo}.{kind}.log"
+        path.write_text(text, encoding="utf-8")
+        result[f"{kind}_log"] = str(path)
 
     start = time.time()
     try:
@@ -122,11 +131,17 @@ def run_single(algo: str, *, dry_run: bool = False) -> dict:
             capture_output=True, text=True, timeout=AGENT_TIMEOUT,
             cwd=workdir,
         )
-        result["agent_output"] = proc.stdout[-2000:]  # 保留尾部
+        result["agent_output"] = proc.stdout[-2000:]  # 摘要保留尾部
+        _write_log("agent", proc.stdout + ("\n--- STDERR ---\n" + proc.stderr if proc.stderr else ""))
         result["status"] = "agent-done"
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         result["status"] = "agent-timeout"
         result["agent_output"] = f"agent 超时（{AGENT_TIMEOUT}s）"
+        # TimeoutExpired 带部分输出——超时题的现场正是分析盲区，必须落盘
+        partial = (exc.stdout or "") + (exc.stderr or "")
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        _write_log("agent", partial or "（超时前无任何输出）")
     except Exception as exc:
         result["status"] = "agent-error"
         result["agent_output"] = str(exc)
@@ -137,6 +152,7 @@ def run_single(algo: str, *, dry_run: bool = False) -> dict:
     pytest_status, pytest_output = run_pytest(workdir)
     result["pytest_status"] = pytest_status
     result["pytest_output"] = pytest_output[-1000:]
+    _write_log("pytest", pytest_output)
 
     if pytest_status == "pass":
         result["status"] = "pass"
@@ -160,18 +176,21 @@ def main() -> None:
         return
 
     print(f"QuixBugs benchmark：{len(tasks)} 个任务（workers={args.workers}）")
+    # 完整输出落盘目录：与结果 json 同名（run-<ts>.json ↔ run-<ts>/）
+    out_path = Path(args.output) if args.output else RESULTS_DIR / f"run-{int(time.time())}.json"
+    log_dir = RESULTS_DIR / out_path.stem
     results: list[dict] = []
     if args.workers <= 1 or args.dry_run:
         for i, algo in enumerate(tasks, 1):
             print(f"[{i}/{len(tasks)}] {algo} ... ", end="", flush=True)
-            r = run_single(algo, dry_run=args.dry_run)
+            r = run_single(algo, dry_run=args.dry_run, log_dir=log_dir)
             results.append(r)
             print(f"{r['status']} (pytest={r['pytest_status']}, {r['duration']}s)")
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         done = 0
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(run_single, algo): algo for algo in tasks}
+            futures = {pool.submit(run_single, algo, log_dir=log_dir): algo for algo in tasks}
             for fut in as_completed(futures):
                 r = fut.result()
                 results.append(r)
@@ -184,11 +203,12 @@ def main() -> None:
     passed = sum(1 for r in results if r["status"] == "pass")
     print(f"\n结果：{passed}/{len(results)} 通过 ({100*passed/len(results):.1f}%)")
 
-    # 保存详细结果
-    out_path = Path(args.output) if args.output else RESULTS_DIR / f"run-{int(time.time())}.json"
+    # 保存详细结果（out_path 在跑题前已定，与 log_dir 同名）
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
     print(f"详细结果已保存：{out_path}")
+    if log_dir.exists():
+        print(f"完整输出日志：{log_dir}/<algo>.agent.log / .pytest.log")
 
 
 if __name__ == "__main__":
