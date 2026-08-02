@@ -516,6 +516,46 @@ def test_report_template_saves_llm():
     print("PASS report template（只读场景零 LLM 调用 + last_ai 答复保留）✔\n")
 
 
+def test_worker_fault_tolerance():
+    """并行 worker 单点失败不拖垮整图：失败降级为 note，兄弟 worker 成果保留。"""
+    alpha, beta = "__scratch_ft_alpha__.txt", "__scratch_ft_beta__.txt"
+
+    class FakeFlaky:
+        """alpha 子任务模拟 API 异常；beta 正常。"""
+        def invoke(self, messages, *a, **k):
+            sys_prompt = str(messages[0].content) if messages else ""
+            if "计划节点" in sys_prompt:
+                return AIMessage(content=json.dumps({
+                    "steps": ["并行"], "parallel_tasks": [f"写 {alpha}", f"写 {beta}"]}))
+            if "评审节点" in sys_prompt:
+                return AIMessage(content="verdict: pass\nfeedback: 部分完成可接受。")
+            if "收尾节点" in sys_prompt:
+                return AIMessage(content="# 报告\n部分完成。")
+            joined = "\n".join(str(m.content) for m in messages)
+            sub_line = next((l for l in joined.split("\n") if "你负责的子任务：" in l), "")
+            if alpha in sub_line:
+                raise ConnectionError("模拟 API 超时/限流")
+            if beta in sub_line:
+                return AIMessage(content="写 beta", tool_calls=[
+                    {"name": "plan_write_file", "args": {"path": beta, "content": "beta ok\n"}, "id": "wb"}])
+            raise AssertionError("FakeFlaky 未匹配到任何分支")
+
+    try:
+        order, state = run_on(FakeFlaky(), f"并行写 {alpha} 和 {beta}",
+                              resume_action={"action": "approve"})
+        assert state["verdict"] == "pass", "单 worker 失败不应拖垮整图"
+        with open(beta, encoding="utf-8") as f:
+            assert f.read() == "beta ok\n", "兄弟 worker 的改动应保留（不被失败方的空 pending 清空）"
+        assert not os.path.exists(alpha), "失败 worker 不应有产出"
+        notes = " ".join(state["worker_notes"])
+        assert "子任务失败" in notes, f"失败 worker 应有失败 note：{notes}"
+        print("PASS worker fault tolerance（单点失败降级 + 兄弟成果保留）✔\n")
+    finally:
+        for f in (alpha, beta):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -532,6 +572,7 @@ if __name__ == "__main__":
         test_tool_usability()
         test_agent_sliding_window()
         test_report_template_saves_llm()
+        test_worker_fault_tolerance()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

@@ -344,63 +344,78 @@ def agent(state: AgentState) -> dict:
     return {"messages": updated, "pending_changes": pending, "current_step": step}
 
 
+def _worker_result(subtask: str, note: str, pending: list[dict]) -> dict:
+    """worker 返回值组装。
+
+    pending 为空时**省略该 key**：_resettable_add 语义里空列表 = 清空，
+    并行分支更新应用顺序不确定，返回 [] 会抹掉兄弟 worker 已聚合的改动。
+    """
+    r: dict = {"worker_notes": [f"「{subtask}」{note}"]}
+    if pending:
+        r["pending_changes"] = pending
+    return r
+
+
 def worker(state: AgentState) -> dict:
     """并行 worker：处理 planner 派生的一个独立子任务，只读 + 暂存，不真执行。
 
     与 agent 节点同构的精简工具循环；不写 messages（并行分支消息会交错混乱），
     产出（pending_changes / worker_notes）经 _resettable_add reducer 聚合。
+    单点失败（API 超时/限流/异常）降级为失败 note，不拖垮整图。
     """
     subtask = state["current_subtask"]
-    messages: list = [
-        SystemMessage(content=WORKER_PROMPT),
-        HumanMessage(content=f"总需求：{state['request']}\n你负责的子任务：{subtask}"),
-    ]
-    pending: list[dict] = []
+    try:
+        messages: list = [
+            SystemMessage(content=WORKER_PROMPT),
+            HumanMessage(content=f"总需求：{state['request']}\n你负责的子任务：{subtask}"),
+        ]
+        pending: list[dict] = []
 
-    for _ in range(MAX_WORKER_ITERATIONS):
-        messages = _sliding_compress(messages, 2, state["request"])
-        ai: AIMessage = _logged_invoke(_make_model(), messages, "worker")
-        messages.append(ai)
-        if not ai.tool_calls:
-            break
-        for tc in ai.tool_calls:
-            name, args = tc.get("name"), tc.get("args") or {}
-            if name == FINAL_ANSWER_TOOL:
-                # 拿到总结即返回，不再 invoke，无需补 ToolMessage
-                note = args.get("answer", "") or "完成"
-                return {"pending_changes": pending,
-                        "worker_notes": [f"「{subtask}」{note}"]}
-            if name in PLAN_TOOL_NAMES:
-                # 与 agent 节点一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
-                blocked = None
-                if name == "plan_run_command":
-                    try:
-                        check_command_safety(args.get("command", ""))
-                        _resolve(args.get("cwd", "."))
-                    except ValueError as exc:
-                        blocked = str(exc)
-                elif name == "plan_run_python":
-                    try:
-                        check_python_safety(args.get("code", ""))
-                    except ValueError as exc:
-                        blocked = str(exc)
-                if blocked:
+        for _ in range(MAX_WORKER_ITERATIONS):
+            messages = _sliding_compress(messages, 2, state["request"])
+            ai: AIMessage = _logged_invoke(_make_model(), messages, "worker")
+            messages.append(ai)
+            if not ai.tool_calls:
+                break
+            for tc in ai.tool_calls:
+                name, args = tc.get("name"), tc.get("args") or {}
+                if name == FINAL_ANSWER_TOOL:
+                    # 拿到总结即返回，不再 invoke，无需补 ToolMessage
+                    note = args.get("answer", "") or "完成"
+                    return _worker_result(subtask, note, pending)
+                if name in PLAN_TOOL_NAMES:
+                    # 与 agent 节点一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
+                    blocked = None
+                    if name == "plan_run_command":
+                        try:
+                            check_command_safety(args.get("command", ""))
+                            _resolve(args.get("cwd", "."))
+                        except ValueError as exc:
+                            blocked = str(exc)
+                    elif name == "plan_run_python":
+                        try:
+                            check_python_safety(args.get("code", ""))
+                        except ValueError as exc:
+                            blocked = str(exc)
+                    if blocked:
+                        messages.append(ToolMessage(
+                            content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"]))
+                        continue
+                    pending.append({"action": name, **args})
+                    summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
                     messages.append(ToolMessage(
-                        content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"]))
-                    continue
-                pending.append({"action": name, **args})
-                summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
-                messages.append(ToolMessage(
-                    content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
-                    tool_call_id=tc["id"]))
-            else:
-                tool_messages = tool_node.invoke(messages)
-                tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
-                messages.extend(tool_messages)
-        if pending:
-            break
-    note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
-    return {"pending_changes": pending, "worker_notes": [f"「{subtask}」{note}"]}
+                        content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
+                        tool_call_id=tc["id"]))
+                else:
+                    tool_messages = tool_node.invoke(messages)
+                    tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
+                    messages.extend(tool_messages)
+            if pending:
+                break
+        note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
+        return _worker_result(subtask, note, pending)
+    except Exception as exc:  # noqa: BLE001 — 并行 worker 单点失败不应拖垮整图
+        return _worker_result(subtask, f"子任务失败：{type(exc).__name__}: {exc}", [])
 
 
 def guard(state: AgentState) -> dict:
@@ -678,7 +693,12 @@ def route_after_planner(state: AgentState):
     """planner 之后：有可并行子任务（≥2）则 Send 扇出 worker，否则走串行 agent。"""
     tasks = state.get("parallel_tasks") or []
     if len(tasks) >= 2:
-        return [Send("worker", {**state, "current_subtask": t}) for t in tasks]
+        # payload 只传 worker 需要的两个 key：完整 state（含 messages/plan）会放大
+        # 每个分支的 checkpoint 序列化开销；worker 的产出经 reducer 聚合不依赖其余字段
+        return [
+            Send("worker", {"request": state["request"], "current_subtask": t})
+            for t in tasks
+        ]
     return "agent"
 
 
