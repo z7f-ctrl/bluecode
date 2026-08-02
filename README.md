@@ -1,6 +1,6 @@
 # Bluecode（小蓝）
 
-> 一个跑在你自己电脑上的个人 coding agent：你说需求，它列计划、动手改代码、跑测试，还会像毒舌同事一样自审挑刺，直到自己满意才交付；涉及写文件 / 执行命令等危险动作时，它会停下来等你确认。
+> 一个跑在你自己电脑上的个人 coding agent：你说需求，它列计划、动手改代码、自动验证、自审挑刺，直到自己满意才交付；涉及写文件 / 执行命令等危险动作时，它会停下来等你确认。
 
 基于 [LangGraph](https://github.com/langchain-ai/langgraph) 实现，核心逻辑全部手写、无框架依赖，兼容任意 OpenAI 兼容接口。
 
@@ -30,9 +30,10 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证，不需要 API key |
+| `python validate_graph.py` | 离线功能验证（9 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
-|| `python agent.py --resume` | 列出历史会话并恢复（v0.2 已实现） |
+| `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
+| `python agent.py --resume` | 列出历史会话并恢复 |
 
 ## 它是怎么工作的
 
@@ -40,24 +41,28 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 用户请求 ──▶ planner（拆计划）──▶ agent（LLM+工具循环）──▶ guard（安全闸门）
                                               ▲            │
                                               │            ▼
-                                              │         reviewer（毒舌评审）
+                                              │        verifier（自动验证）
+                                              │            │
+                                              │            ▼
+                                              │        reviewer（评审）
                                               │            │
                                               └──revise───  │ pass
                                                             ▼
                                                          report（交付）
 ```
 
-五个节点（`agent.py`）：
+六个节点（`agent.py`）：
 
 | 节点 | 职责 |
 |---|---|
-| `planner` | 把需求拆成 3~6 步中文计划（JSON 解析失败自动降级为单步） |
-| `agent` | 手写工具循环；只读工具直接执行，写/执行工具只**暂存**到 `pending_changes`，不真动手 |
-| `guard` | 有待审批改动时 `interrupt()` 冻结图，等你 `y`/`n`/`m`；通过才真正写文件/跑命令 |
-| `reviewer` | 「毒舌老蓝」自审：`verdict: pass / revise`，revise 弹回 agent 重改（上限 3 轮） |
-| `report` | 汇总改动清单 + 评审轮数 + 执行结果，输出 Markdown 交付报告 |
+| `planner` | 把需求拆成 3~6 步中文计划；简单需求（短、无多步骤词）跳过模型调用直接单步 |
+| `agent` | 手写工具循环；只读工具直接执行，写/执行工具只**暂存**到 `pending_changes`，不真动手；`final_answer` 显式终止 |
+| `guard` | 有待审批改动时 `interrupt()` 冻结图，等你 `y`/`n`/`m`；通过才真正执行；`--auto-approve` 模式下自动放行 |
+| `verifier` | 审批通过后自动验证：`py_compile` 语法检查改动文件 + 自动发现并跑 pytest（最多 3 个文件，30s 超时），结果追加到 feedback |
+| `reviewer` | 自审：`verdict: pass / revise`，revise 弹回 agent 重改（上限 3 轮）；判定有 verifier 的客观验证结果做依据 |
+| `report` | 汇总改动清单 + 评审轮数 + 验证/执行结果，输出 Markdown 交付报告 |
 
-**安全模型**：工作目录沙箱（路径越界直接拒）+ 命令危险关键词启发式拦截（`rm -rf`/管道/sudo/reboot 等）+ 关键的最后一道人工审批。两条防线叠加，缺一不可——命令校验同时挂在「agent 暂存时」和「guard 审批执行前」两处。
+**安全模型**：工作目录沙箱（路径越界直接拒）+ 命令黑名单关键词拦截 + 可选命令白名单（`BLUE_COMMAND_WHITELIST`）+ 关键的最后一道人工审批。命令校验同时挂在「agent 暂存时」和「guard 审批执行前」两处（双路径）。
 
 ## 状态设计
 
@@ -70,34 +75,57 @@ class AgentState(TypedDict):
     pending_changes: list[dict]               # 待审批改动 [{action, ...}]
     review_rounds: int                        # 自审轮数（上限 3）
     verdict: str                              # pass / revise / proceed / rejected / approved
-    feedback: str                             # 评审意见 / 执行结果
+    feedback: str                             # 评审意见 / 执行结果 / 自动验证结果
 ```
 
 ## 工具集（`tools.py`）
 
-| 工具 | 类型 | 审批 | 说明 |
-|---|---|---|---|
-| `list_files` | 只读 | 否 | 列目录（沙箱内） |
-| `read_file` | 只读 | 否 | 带行号读取 |
-| `grep` | 只读 | 否 | 正则搜索（最多 50 条） |
-| `plan_write_file` | 暂存 | **是** | 完整覆盖写入 |
-| `plan_patch` | 暂存 | **是** | 唯一 old→new 文本替换 |
-| `plan_run_command` | 暂存 | **是** | shell 命令（timeout 60s + 危险词拦截） |
+只读工具（免审批）：
 
-所有工具路径都经 `resolve()` 校验，越界即报错；工作目录固定为当前项目目录。
+| 工具 | 说明 |
+|---|---|
+| `list_files` | 列目录（沙箱内） |
+| `read_file` | 带行号读取（单次最多 500 行） |
+| `grep` | 正则搜索（最多 50 条） |
+| `final_answer` | 任务完成时显式终止 agent 循环，给出最终答复摘要 |
+
+暂存工具（需审批，只攒 `pending_changes` 不真执行）：
+
+| 工具 | 说明 |
+|---|---|
+| `plan_write_file` | 完整覆盖写入 |
+| `plan_patch` | 唯一 old→new 文本替换 |
+| `plan_run_command` | shell 命令（timeout 60s + 黑名单拦截 + 可选白名单） |
+| `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
+
+所有路径经 `_resolve()` 校验，越界即报错；工作目录固定为当前项目目录。
+
+### 命令白名单（可选）
+
+```bash
+# .env 或环境变量：设置后命令头必须在白名单内，否则拦截
+BLUE_COMMAND_WHITELIST=python3,pytest,ls,cat
+```
+
+未设置时保持黑名单现状（拦 `rm -rf`/管道/sudo 等）；设置后升级为「没列的都拦」，误伤更少、语义更直白。
 
 ## 项目结构
 
 ```
-langgraph/
-├── agent.py            # 状态、节点、建图、CLI（~300 行）
-├── tools.py            # 6 工具 + 安全校验（check_command_safety）
-├── prompts.py          # planner / agent / 毒舌评审 / report 提示词
-├── validate_graph.py   # 离线功能验证（fake model，不需 API key）
+bluecode/
+├── agent.py            # 状态、节点、建图、CLI、step 回调机制（~780 行）
+├── tools.py            # 8 工具 + 安全校验（命令/Python 双路径）
+├── prompts.py          # planner / agent / reviewer / report 提示词（文案集中）
+├── validate_graph.py   # 离线功能验证（fake model，9 项，不需 API key）
 ├── requirements.txt
-├── .env.example     # 配置模板（入库），复制为 .env 后填真实值
-├── .env             # 本地配置（不入库，含密钥）
-└── design.md        # 设计稿（§5~§8 是实现的直接来源）
+├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
+├── .env                # 本地配置（不入库，含密钥）
+├── design.md           # v0.1 设计稿（历史文档，实现已演进超出）
+└── benchmarks/
+    └── quixbugs/       # QuixBugs 修 bug 基准（31 题，见 README）
+        ├── prepare.py        # 题库提取
+        ├── run_benchmark.py  # 基准 runner
+        └── README.md
 ```
 
 > AGENTS.md（含本地环境细节）已被 .gitignore 排除，不入库。
@@ -105,12 +133,26 @@ langgraph/
 ## 验证
 
 ```bash
-# 离线六路验证：只读 / 写+审批通过 / 拒绝 / revise 回边 / cwd 越界双路径拦截
+# 离线 9 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
 
 真机验证需要 API key（见「快速开始」）。真实模型会触发 revise 回边和 interrupt 审批——这是设计意图，不是 bug。
+
+## Benchmark（QuixBugs）
+
+内置 [QuixBugs](https://github.com/jkoppel/QuixBugs) 31 个算法修 bug 题作为能力评测：
+
+```bash
+git clone --depth 1 https://github.com/jkoppel/QuixBugs.git /tmp/quixbugs-src
+python3 benchmarks/quixbugs/prepare.py                 # 生成题库
+python3 benchmarks/quixbugs/run_benchmark.py           # 全量 31 题
+python3 benchmarks/quixbugs/run_benchmark.py --algo gcd  # 单题冒烟
+```
+
+详见 `benchmarks/quixbugs/README.md`。
 
 ## Roadmap
 
@@ -118,25 +160,29 @@ python validate_graph.py
 |---|---|---|
 | v0.1 | 单文件跑通 plan→act→guard→review 全流程 + CLI 交互 | ✅ 已实现 |
 | v0.2 | `SqliteSaver` 持久化 + 多轮会话 + 斜杠命令 + `--resume` | ✅ 已实现 |
-| v0.3 | 多文件并行修改（`Send`），评审意见按文件分发 | 未实现 |
-| v0.4 | LangGraph Studio 可视化调试 | 未实现 |
-| v0.5 | 评测集（10 个标准任务） | 未实现 |
+| v0.2.5 | reviewer 风格收敛（去毒舌人设）+ planner 条件化 + verifier 自动验证节点 | ✅ 已实现 |
+| v0.3 | 借鉴 smolagents：`final_answer` 显式终止 + 命令白名单 + `plan_run_python` 受限沙箱 + step 回调注册机制 | ✅ 已实现 |
+| v0.4 | QuixBugs benchmark（31 题修 bug 判分）+ `--auto-approve` 模式 | ✅ 已实现 |
+| v0.5 | 多文件并行修改（`Send`），评审意见按文件分发 | 未实现 |
+| v0.6 | LangGraph Studio 可视化调试 | 未实现 |
+| v0.7 | 基准扩展：9 个图算法题接入、FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy | 未实现 |
 
 ## 安全说明（重要）
 
 - **API key 只放在本地 `.env`（已被 .gitignore 排除）或环境变量**，绝不写进代码或已提交的文件。不要把 `.env` 同步到网盘/云存储。
-- `test2.py` 硬编码过一个真实 key，**该文件已被 `.gitignore` 排除，不进入版本库**；但它仍在你的本地磁盘上。建议尽快轮换该 key（design §12 已要求），轮换后如确认无敏感信息可移出 .gitignore。
-- 危险命令拦截是启发式的，不是完备沙箱——**真正的安全门槛是 guard 人工审批**，不要让它在无人值守模式下自动运行。
+- `test2.py` 硬编码过一个真实 key，**该文件已被 `.gitignore` 排除，不进入版本库**；但它仍在你的本地磁盘上。建议尽快轮换该 key。
+- 危险命令拦截是启发式的，不是完备沙箱——**真正的安全门槛是 guard 人工审批**。`--auto-approve` 仅限 benchmark/CI 场景，不要在生产代码库上无人值守运行。
+- `plan_run_python` 的沙箱（ast 检查 + 受限 builtins）是纵深防御的一层，不是完备隔离——同样依赖审批兜底。
 - 默认只读优先：模型被引导先读后写，写操作必须过审批。
 
-## 已知限制（v0.2）
+## 已知限制
 
-- `astream_events` token 级流式输出未做，当前是节点级播报。
-- reviewer 的 `feedback` 会携带原始 `verdict:` 行一起打印，略显粗糙。
-- 毒舌评审每次任务要多轮 LLM 调用（通常 4~7 次），API 限流时体验会慢。
+- `astream_events` token 级流式输出未做，当前是节点级播报（已通过 step 回调机制解耦，可挂自定义 UI）。
+- reviewer 每次任务要多轮 LLM 调用（通常 4~7 次），API 限流时体验会慢。
 - 会话元信息（`sessions` 表）与 LangGraph checkpoint 分开存储，极端情况下可能不一致（如手动删 checkpoint 文件）。
+- `plan_run_python` 无 CPU/内存硬限制（有 30s 超时和 ast 节点数上限），恶意代码仍可能耗资源——审批时留意。
 
-## 多轮会话与斜杠命令（v0.2 新增）
+## 多轮会话与斜杠命令
 
 直接运行 `python agent.py`（不带参数）即进入多轮模式：
 
@@ -151,3 +197,14 @@ python validate_graph.py
 可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume`。
 
 会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。
+
+## 扩展：step 回调
+
+节点输出通过回调链处理（借鉴 smolagents），默认回调是 CLI 打印。挂自定义 UI/日志：
+
+```python
+import agent
+agent.register_step_callback(lambda node, output: my_ui.render(node, output))
+```
+
+回调异常不阻断主流程；`agent.clear_step_callbacks()` 可清空。

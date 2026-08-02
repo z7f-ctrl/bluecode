@@ -1,7 +1,8 @@
 # 个人版 Coding Agent 设计文档
 
 > 一个精简、有趣、能真正跑起来的个人编程助手，用 LangGraph 的核心能力实现。
-> 文档状态：v0.1 设计稿（先设计，后实现）
+> 文档状态：**v0.1 设计稿（历史文档）**。实现已演进超出本文档——当前状态见 README.md。
+> 主要偏差：reviewer 已去毒舌人设（v0.2.5）；图新增 verifier 自动验证节点；工具集扩至 8 个（新增 final_answer、plan_run_python）；agent 节点为手写工具循环而非 create_react_agent（§6.2 的备选方案）。
 
 ---
 
@@ -219,11 +220,13 @@ langgraph/
 
 ## 11. Roadmap（按优先级）
 
-1. **v0.1（本次）**：单文件跑通 plan → act → guard → review 全流程 + CLI 流式输出
-2. **v0.2**：SqliteSaver 持久化 + `--resume` / 会话列表
-3. **v0.3**：多文件并行修改（`Send`），评审意见按文件分发
-4. **v0.4**：接入 LangGraph Studio 可视化调试，评审节点可视化回放
-5. **v0.5**：评测集（10 个标准任务），记录每次的 review 轮数、成功率
+> 截至 v0.4 的实际进度，见 README.md 的 Roadmap 表。
+
+1. **v0.1**：单文件跑通 plan → act → guard → review 全流程 + CLI 流式输出 ✅
+2. **v0.2**：SqliteSaver 持久化 + `--resume` / 会话列表 ✅（含多轮会话 + 斜杠命令）
+3. **v0.3**：多文件并行修改（`Send`），评审意见按文件分发 —— 未实现；实际 v0.3 做了 smolagents 四件套（final_answer / 命令白名单 / plan_run_python / step 回调）
+4. **v0.4**：接入 LangGraph Studio 可视化调试 —— 未实现；实际 v0.4 做了 QuixBugs benchmark
+5. **v0.5**：评测集（10 个标准任务），记录每次的 review 轮数、成功率 —— 已超额实现（QuixBugs 31 题）
 
 ## 12. 风险与对策
 
