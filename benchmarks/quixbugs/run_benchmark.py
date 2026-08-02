@@ -29,7 +29,7 @@ RESULTS_DIR = ROOT / "results"
 AGENT_PY = ROOT.parents[1] / "agent.py"  # 项目根目录的 agent.py，避免硬编码绝对路径
 
 # 超时配置（秒）
-AGENT_TIMEOUT = 120  # agent 单题最大运行时间
+AGENT_TIMEOUT = 180  # agent 单题最大运行时间（120s 实测大量题顶格，fail-closed 后修订轮次增多）
 PYTEST_TIMEOUT = 15   # pytest 单题最大运行时间（防死循环）
 
 

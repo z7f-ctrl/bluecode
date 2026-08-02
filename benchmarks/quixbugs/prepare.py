@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 QuixBugs 的 31 个简单算法题提取为独立任务目录。
+"""把 QuixBugs 的 40 个算法题（31 个简单题 + 9 个图/链表题）提取为独立任务目录。
 
 每个任务目录结构：
   tasks/<name>/
@@ -32,6 +32,13 @@ SIMPLE_ALGOS = [
     "sqrt", "subsequences", "to_base", "wrap",
 ]
 
+# 9 个依赖 node.py（Node 类）的图/链表算法题；测试在文件内直接构造图，无 json 数据
+GRAPH_ALGOS = [
+    "breadth_first_search", "depth_first_search", "detect_cycle",
+    "minimum_spanning_tree", "reverse_linked_list", "shortest_path_length",
+    "shortest_path_lengths", "shortest_paths", "topological_ordering",
+]
+
 
 def extract_task(algo: str) -> dict:
     """提取一个任务到独立目录。返回 meta。"""
@@ -43,6 +50,9 @@ def extract_task(algo: str) -> dict:
     if not buggy_src.exists():
         return {"name": algo, "status": "missing_buggy"}
     shutil.copy(buggy_src, task_dir / "buggy.py")
+    # 图/链表题额外依赖公共 Node 类定义（测试文件里 from node import Node）
+    if algo in GRAPH_ALGOS:
+        shutil.copy(SRC / "python_programs" / "node.py", task_dir / "node.py")
 
     # 2. 测试文件：改写 import 路径，让测试直接 import buggy
     test_src = SRC / "python_testcases" / f"test_{algo}.py"
@@ -117,9 +127,10 @@ def main() -> None:
     if not SRC.exists():
         print(f"错误：QuixBugs 源码不在 {SRC}，请先 git clone")
         return
-    results = [extract_task(a) for a in SIMPLE_ALGOS]
+    algos = SIMPLE_ALGOS + GRAPH_ALGOS
+    results = [extract_task(a) for a in algos]
     ok = [r for r in results if r["status"] == "ok"]
-    print(f"提取完成：{len(ok)}/{len(SIMPLE_ALGOS)} 个任务就绪")
+    print(f"提取完成：{len(ok)}/{len(algos)} 个任务就绪")
     for r in results:
         if r["status"] != "ok":
             print(f"  跳过 {r['name']}: {r['status']}")
