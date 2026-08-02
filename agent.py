@@ -377,7 +377,10 @@ def reviewer(state: AgentState) -> dict:
         v = m.group(1).lower()
         new_verdict: Literal["pass", "revise"] = "revise" if v == "revise" else "pass"
     else:
-        new_verdict = "revise" if re.search(r"\brevise\b", text) else "pass"
+        # 模型未按格式输出时 fail-closed：默认打回而非放行（实测模型常用自然语言
+        # 回答"我先读一下代码"，无 verdict 关键字，fail-open 会导致 bug 未修就交付）。
+        # 不会死循环：到 MAX_REVIEW_ROUNDS 上限下面会强制放行。
+        new_verdict = "revise"
     new_rounds = rounds + 1
     if new_verdict == "revise" and new_rounds >= MAX_REVIEW_ROUNDS:
         new_verdict = "pass"
