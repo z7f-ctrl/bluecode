@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（12 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（14 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -137,9 +137,9 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 12 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 14 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
-# 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）
+# 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）/ 滑动窗口 / report 模板化
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -185,6 +185,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 ## 已知限制
 
 - `astream_events` token 级流式输出未做，当前是节点级播报（已通过 step 回调机制解耦，可挂自定义 UI）。
+- agent/worker 工具循环内有滑动窗口（`AGENT_MSG_WINDOW=20`）：较早的工具交互会被压缩成摘要喂给后续调用，极端长任务里模型可能"忘记"早期细节（摘要保留了文件/改动/执行结果的要点）。
+- 只读/拒绝场景的交付报告是模板直出（不调 LLM），文风朴素；涉及实际改动的报告仍由 LLM 组织语言。
 - reviewer 每次任务要多轮 LLM 调用（通常 4~7 次），API 限流时体验会慢。
 - 会话元信息（`sessions` 表）与 LangGraph checkpoint 分开存储，极端情况下可能不一致（如手动删 checkpoint 文件）。
 - `plan_run_python` 无 CPU/内存硬限制（有 30s 超时和 ast 节点数上限），恶意代码仍可能耗资源——审批时留意。

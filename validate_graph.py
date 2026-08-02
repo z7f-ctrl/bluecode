@@ -8,7 +8,7 @@ import tempfile
 from unittest.mock import patch
 
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 # 在 import agent 之前把 DB_PATH 指到临时文件，避免测试写入用户真实数据库
@@ -459,6 +459,63 @@ def test_tool_usability():
             os.remove(scratch)
 
 
+def test_agent_sliding_window():
+    """agent 循环内滑动窗口：长工具序列后，invoke 看到的历史被压缩且带摘要。"""
+    class RecordingFake:
+        """记录每次 invoke 的消息数和是否含【早前操作摘要】。"""
+        def __init__(self, seq):
+            self.seq = list(seq)
+            self.seen: list[tuple[int, bool]] = []
+
+        def invoke(self, messages, *a, **k):
+            self.seen.append((
+                len(messages),
+                any(isinstance(m, HumanMessage) and "【早前操作摘要】" in str(m.content) for m in messages),
+            ))
+            item = self.seq.pop(0) if self.seq else AIMessage(content="done")
+            return item if isinstance(item, AIMessage) else AIMessage(content=item)
+
+    calls = [AIMessage(content='["查"]')]  # planner
+    for i in range(13):  # 13 次 grep：head=3、每轮 +2，第 12 次 invoke 前 len=25 > 3+20 触发窗口
+        calls.append(AIMessage(content=f"查{i}", tool_calls=[
+            {"name": "grep", "args": {"pattern": f"p{i}"}, "id": f"g{i}"}]))
+    calls.append(AIMessage(content="查完了。"))                       # agent 收尾
+    calls.append(AIMessage(content="verdict: pass\nfeedback: 只读 ok。"))  # reviewer
+    fake = RecordingFake(calls)
+    order, state = run_on(fake, "反复查很多东西")
+    agent_seen = fake.seen[1:15]  # agent 的 14 次调用（13 grep + 1 收尾）
+    lengths = [n for n, _ in agent_seen]
+    has_summary = any(s for _, s in agent_seen[1:])  # 第 2 次调用起某轮应带摘要
+    print(f"sliding-window：agent invoke 消息数 {lengths}")
+    assert has_summary, "窗口压缩应产生【早前操作摘要】"
+    # 稳态：head(3) + 摘要(1) + 窗口(20) ≈ 24，留余量断言上限
+    assert max(lengths) <= agent.AGENT_MSG_WINDOW + 6, \
+        f"滑动窗口应压住消息数（≈{agent.AGENT_MSG_WINDOW}+6），实际 {max(lengths)}"
+    assert state["verdict"] == "pass"
+    print("PASS agent sliding window（循环内压缩 + 摘要衔接）✔\n")
+
+
+def test_report_template_saves_llm():
+    """只读/拒绝场景 report 走模板，不调 LLM（省 ~2000 token/次）。
+
+    只读路径的模型调用：planner(1) + agent(N)。reviewer 对 proceed 短路不调 LLM，
+    report 模板化后也不调——整个只读任务比此前省 report 那一次调用。"""
+    calls = [
+        AIMessage(content='["读"]'),                                    # planner
+        AIMessage(content="查一下", tool_calls=[
+            {"name": "grep", "args": {"pattern": "hello"}, "id": "g1"}]),
+        AIMessage(content="找到 3 处。"),                                # agent 收尾（last_ai）
+        AIMessage(content="verdict: pass\nfeedback: 不应被消耗"),        # reviewer proceed 短路
+        AIMessage(content="这条也不应被消耗（report 已模板化）"),
+    ]
+    fake = FakeModel(calls)
+    order, state = run_on(fake, "统计 hello 出现次数")
+    assert fake.calls == 3, f"只读任务应只调 3 次模型（planner+agent×2），实际 {fake.calls}"
+    assert "交付报告" in state["feedback"], "report 应输出模板报告"
+    assert "找到 3 处" in state["feedback"], "模板报告应带上 last_ai 答复"
+    print("PASS report template（只读场景零 LLM 调用 + last_ai 答复保留）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -473,6 +530,8 @@ if __name__ == "__main__":
         test_parallel_workers_fanout()
         test_security_hardening()
         test_tool_usability()
+        test_agent_sliding_window()
+        test_report_template_saves_llm()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

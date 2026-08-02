@@ -262,6 +262,7 @@ def agent(state: AgentState) -> dict:
     # revise 回环时 state["messages"] 已被 reviewer 压缩成单条摘要，直接复用
     messages.extend(state["messages"])
     messages.append(HumanMessage(content=tip))
+    head_len = len(messages)  # 头部固定不动；循环内滑动窗口只压缩之后的工具交互
 
     updated: list = []
     # delta 语义：pending_changes 有 _resettable_add reducer，这里只收集本轮新增，
@@ -272,6 +273,7 @@ def agent(state: AgentState) -> dict:
 
     while iterations < MAX_TOOL_ITERATIONS:
         iterations += 1
+        messages = _sliding_compress(messages, head_len, state["request"])
         ai: AIMessage = _logged_invoke(_make_model(), messages, "agent")
         messages.append(ai)
         updated.append(ai)
@@ -356,6 +358,7 @@ def worker(state: AgentState) -> dict:
     pending: list[dict] = []
 
     for _ in range(MAX_WORKER_ITERATIONS):
+        messages = _sliding_compress(messages, 2, state["request"])
         ai: AIMessage = _logged_invoke(_make_model(), messages, "worker")
         messages.append(ai)
         if not ai.tool_calls:
@@ -467,6 +470,51 @@ def _compress_messages(messages: list, request: str) -> str:
     return "\n".join(parts)
 
 
+AGENT_MSG_WINDOW = 20  # agent/worker 循环内保留的最近工具交互条数（超出部分压缩成摘要）
+
+
+def _sliding_compress(messages: list, head_len: int, request: str) -> list:
+    """工具循环内的滑动窗口：消息膨胀时把较早轮次压缩成一条摘要。
+
+    revise 回环的压缩（reviewer）管跨轮次，这里管单次循环内：模型连调
+    N 次 read_file/grep 后，全量历史会让每次 invoke 的 token 线性膨胀。
+
+    head_len：头部固定不动的条数（system + request + 历史摘要 + tip）。
+    完整性约束：按「一轮 = AIMessage + 其 ToolMessage 序列」整组切除，
+    不留孤儿 ToolMessage（API 会 400）。旧摘要组并入新摘要，不丢历史。
+    """
+    overflow = len(messages) - head_len - AGENT_MSG_WINDOW
+    if overflow <= 0:
+        return messages
+    head, body = messages[:head_len], messages[head_len:]
+    # 按轮分组：AIMessage 开新组，其余（ToolMessage/旧摘要 HumanMessage）并入当前组
+    groups: list[list] = []
+    for m in body:
+        if isinstance(m, AIMessage):
+            groups.append([m])
+        elif groups:
+            groups[-1].append(m)
+        else:
+            groups.append([m])
+    # 切掉最早若干组，直到覆盖 overflow
+    cut, gi = 0, 0
+    while gi < len(groups) and cut < overflow:
+        cut += len(groups[gi])
+        gi += 1
+    if gi == 0:
+        return messages
+    dropped = [m for g in groups[:gi] for m in g]
+    # _compress_messages 只提取 AI/Tool 信息；旧摘要（HumanMessage）需手动衔接保留
+    old_summary = "\n".join(
+        str(m.content) for m in dropped
+        if isinstance(m, HumanMessage) and str(m.content).startswith("【早前操作摘要】")
+    )
+    new_summary = _compress_messages(dropped, request)
+    merged = "\n".join(s for s in (old_summary, new_summary) if s)
+    kept = [m for g in groups[gi:] for m in g]
+    return head + [HumanMessage(content=f"【早前操作摘要】\n{merged}")] + kept
+
+
 def verifier(state: AgentState) -> dict:
     """审批通过后自动验证：语法检查 + 尝试跑测试。结果供 reviewer 参考。"""
     verdict = state.get("verdict", "proceed")
@@ -523,9 +571,13 @@ def verifier(state: AgentState) -> dict:
                 if r.returncode == 0:
                     results.append(f"✓ {tf} 测试通过")
                 else:
-                    # 只保留关键错误行
-                    err_lines = [l for l in r.stdout.split("\n") if "FAILED" in l or "Error" in l or "assert" in l.lower()]
-                    results.append(f"✗ {tf} 测试失败：{'; '.join(err_lines[:3])}")
+                    # 只保留关键错误行（单行截 200 字符防长 assert 展开行）；
+                    # 无关键行时 fallback 到输出尾部——否则 reviewer 看到空失败信息
+                    err_lines = [l[:200] for l in r.stdout.split("\n")
+                                 if "FAILED" in l or "Error" in l or "assert" in l.lower()]
+                    if not err_lines:
+                        err_lines = [l[:200] for l in r.stdout.strip().split("\n")[-5:]]
+                    results.append(f"✗ {tf} 测试失败：{'; '.join(err_lines[:5])}")
             except subprocess.TimeoutExpired:
                 results.append(f"? {tf} 测试超时（30s）")
             except Exception as exc:
@@ -587,6 +639,19 @@ def reviewer(state: AgentState) -> dict:
 
 
 def report(state: AgentState) -> dict:
+    fb = state.get("feedback", "")
+    # 只读 / 拒绝场景模板化，省一次 LLM 调用（~2000 token）。
+    # 特征串与 reviewer 固定文案耦合（guard-verifier 的【改动文件】同类约定），改文案两边同步。
+    if "本次为只读任务" in fb:
+        last_ai = next(
+            (m.content for m in reversed(state.get("messages", []))
+             if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
+            "",
+        )
+        body = f"本次为只读任务，未做任何改动。\n\n**答复**：{last_ai}" if last_ai else "本次为只读任务，未做任何改动。"
+        return {"feedback": f"# 交付报告\n\n{body}"}
+    if "（用户已拒绝）" in fb:
+        return {"feedback": "# 交付报告\n\n改动未通过审批，未执行任何操作。"}
     resp = _logged_invoke(
         _make_plain_model(),
         [
