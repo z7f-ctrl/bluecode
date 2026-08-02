@@ -106,6 +106,7 @@ def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> st
 @tool
 def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
     """在工作目录内按正则搜索文本。返回匹配的 文件名:行号:内容，最多 50 条。
+    单行内容截断到 200 字符（防 minified JS/CSS 单行撑爆上下文）。
     glob 可选，用于限定文件（如 '*.py'）。"""
     p = _resolve(path)
     if not p.exists():
@@ -124,7 +125,10 @@ def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
                 continue
             for i, line in enumerate(text.splitlines(), 1):
                 if re.search(pattern, line):
-                    results.append(f"{fp.relative_to(WORKDIR)}:{i}:{line.strip()}")
+                    body = line.strip()
+                    if len(body) > 200:
+                        body = body[:200] + "…"
+                    results.append(f"{fp.relative_to(WORKDIR)}:{i}:{body}")
                     if len(results) >= 50:
                         return "\n".join(results) + "\n…（已截断，最多显示 50 条）"
     return "\n".join(results) if results else "（无匹配）"
@@ -143,12 +147,14 @@ def plan_write_file(path: str, content: str) -> str:
 
 
 @tool
-def plan_patch(path: str, old: str, new: str) -> str:
+def plan_patch(path: str, old: str, new: str, occurrence: int = 0) -> str:
     """【暂存】计划替换文件中某段文本（old→new）。不会真的执行。
-    审批通过后会先在文件中找到唯一的 old 再替换。
+    审批通过后会先在文件中找到 old 再替换。
+    默认要求 old 唯一匹配（歧义即拒绝，防误改）；多处出现时传 occurrence=N
+    指定替换第 N 次出现（1 起），比重写整个文件省 token。
     适用于局部修改，比 plan_write_file 更节省 token。"""
     _resolve(path)
-    return f"plan_patch(path={path}, old_len={len(old)}, new_len={len(new)}) 已暂存——等待审批。"
+    return f"plan_patch(path={path}, old_len={len(old)}, new_len={len(new)}, occurrence={occurrence}) 已暂存——等待审批。"
 
 
 def check_command_safety(command: str) -> None:
@@ -353,10 +359,24 @@ def execute_change(change: dict) -> str:
             p = _resolve(path)
             text = p.read_text(encoding="utf-8")
             old, new = change["old"], change["new"]
-            if old not in text:
+            count = text.count(old)
+            occurrence = int(change.get("occurrence", 0) or 0)
+            if occurrence > 0:
+                # 指定替换第 N 次出现（1 起）：多处相同代码不用重写整个文件
+                if count < occurrence:
+                    return f"失败：{path} 中待替换文本只出现 {count} 次，无法定位第 {occurrence} 次"
+                idx = -1
+                for _ in range(occurrence):
+                    idx = text.find(old, idx + 1)
+                p.write_text(text[:idx] + new + text[idx + len(old):], encoding="utf-8")
+                return f"已补丁 {path}（第 {occurrence}/{count} 处）"
+            if occurrence < 0:
+                return f"失败：occurrence 必须 ≥ 0（0=唯一匹配，N=第 N 次出现），实际 {occurrence}"
+            if count == 0:
                 return f"失败：{path} 中未找到待替换文本"
-            if text.count(old) > 1:
-                return f"失败：{path} 中待替换文本出现 {text.count(old)} 次，需用 plan_write_file"
+            if count > 1:
+                return (f"失败：{path} 中待替换文本出现 {count} 次。"
+                        f"可传 occurrence=N（1~{count}）指定替换第 N 处，或用 plan_write_file")
             p.write_text(text.replace(old, new, 1), encoding="utf-8")
             return f"已补丁 {path}"
 

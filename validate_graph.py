@@ -421,6 +421,44 @@ def test_security_hardening():
     print("PASS security hardening（&& ; $() 反引号 / subprocess / getattr+setattr dunder）✔\n")
 
 
+def test_tool_usability():
+    """grep 长行截断 + plan_patch occurrence 指定第 N 处替换。"""
+    from tools import execute_change, grep
+
+    scratch = "__scratch_usability__.txt"
+    try:
+        # 1. grep：单行截断到 200 字符 + …（防 minified 长行撑爆上下文）
+        with open(scratch, "w", encoding="utf-8") as f:
+            f.write("short match\n" + "x" * 500 + " match tail\n")
+        out = grep.invoke({"pattern": "match", "path": scratch})
+        for line in out.split("\n"):
+            content = line.split(":", 2)[-1]
+            assert len(content) <= 201, f"grep 结果行应 ≤201 字符（200+…），实际 {len(content)}"
+        assert "…" in out, "长行应有 … 后缀"
+
+        # 2. plan_patch occurrence=2：只替换第 2 处
+        with open(scratch, "w", encoding="utf-8") as f:
+            f.write("foo A\nfoo B\nfoo C\n")
+        r = execute_change({"action": "plan_patch", "path": scratch,
+                            "old": "foo", "new": "bar", "occurrence": 2})
+        assert "已补丁" in r and "第 2/3 处" in r, f"occurrence=2 应成功：{r}"
+        with open(scratch, encoding="utf-8") as f:
+            assert f.read() == "foo A\nbar B\nfoo C\n", "应只替换第 2 处"
+
+        # 3. occurrence 超界报错
+        r = execute_change({"action": "plan_patch", "path": scratch,
+                            "old": "foo", "new": "bar", "occurrence": 5})
+        assert "失败" in r and "只出现 2 次" in r, f"occurrence=5 超界应失败：{r}"
+
+        # 4. 默认（occurrence=0）多处仍拒绝，且报错文案指引 occurrence 用法
+        r = execute_change({"action": "plan_patch", "path": scratch, "old": "foo", "new": "bar"})
+        assert "失败" in r and "occurrence=N" in r, f"默认多处匹配应拒绝并指引：{r}"
+        print("PASS tool usability（grep 长行截断 + plan_patch occurrence）✔\n")
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -434,6 +472,7 @@ if __name__ == "__main__":
         test_skip_planner_for_simple_request()
         test_parallel_workers_fanout()
         test_security_hardening()
+        test_tool_usability()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

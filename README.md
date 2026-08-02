@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（11 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（12 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -90,7 +90,7 @@ class AgentState(TypedDict):
 |---|---|
 | `list_files` | 列目录（沙箱内） |
 | `read_file` | 带行号读取（单次最多 500 行） |
-| `grep` | 正则搜索（最多 50 条） |
+| `grep` | 正则搜索（最多 50 条，单行截断 200 字符防 minified 长行） |
 | `final_answer` | 任务完成时显式终止 agent 循环，给出最终答复摘要 |
 
 暂存工具（需审批，只攒 `pending_changes` 不真执行）：
@@ -98,7 +98,7 @@ class AgentState(TypedDict):
 | 工具 | 说明 |
 |---|---|
 | `plan_write_file` | 完整覆盖写入 |
-| `plan_patch` | 唯一 old→new 文本替换 |
+| `plan_patch` | old→new 文本替换：默认要求唯一匹配（歧义即拒防误改）；多处时传 `occurrence=N` 指定替换第 N 处，比重写整个文件省 token |
 | `plan_run_command` | shell 命令（timeout 60s + 黑名单拦截 + 可选白名单） |
 | `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单——不含 subprocess，防绕过命令校验 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec，getattr/setattr 包装拦 dunder 字符串参数）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
 
@@ -137,9 +137,9 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 11 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 12 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
-# 安全加固（命令复合符 / subprocess / getattr dunder）
+# 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
