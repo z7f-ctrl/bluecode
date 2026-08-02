@@ -47,10 +47,12 @@ from langgraph.types import Command, interrupt
 from prompts import AGENT_PROMPT, PLANNER_PROMPT, REPORT_PROMPT, REVIEWER_PROMPT
 from tools import (
     ALL_TOOLS,
+    FINAL_ANSWER_TOOL,
     PLAN_TOOL_NAMES,
     READ_ONLY_TOOLS,
     _resolve,
     check_command_safety,
+    check_python_safety,
     execute_change,
 )
 
@@ -155,6 +157,17 @@ def agent(state: AgentState) -> dict:
             break
         for tc in ai.tool_calls:
             name, args = tc.get("name"), tc.get("args") or {}
+            if name == FINAL_ANSWER_TOOL:
+                # 显式终止：只读工具，直接执行并把 answer 作为最终答复
+                tool_messages = tool_node.invoke(messages)
+                tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
+                for tm in tool_messages:
+                    messages.append(tm)
+                    updated.append(tm)
+                # 把 final_answer 内容提炼成一条 AIMessage，作为本轮收尾
+                answer_text = args.get("answer", "")
+                updated.append(AIMessage(content=answer_text))
+                return {"messages": updated, "pending_changes": pending, "current_step": step}
             if name in PLAN_TOOL_NAMES:
                 blocked = None
                 if name == "plan_run_command":
@@ -163,9 +176,14 @@ def agent(state: AgentState) -> dict:
                         _resolve(args.get("cwd", "."))
                     except ValueError as exc:
                         blocked = str(exc)
+                elif name == "plan_run_python":
+                    try:
+                        check_python_safety(args.get("code", ""))
+                    except ValueError as exc:
+                        blocked = str(exc)
                 if blocked:
                     tool_msg = ToolMessage(
-                        content=f"命令被拦截：{blocked} 请换一条安全的命令。",
+                        content=f"被拦截：{blocked} 请修正后重试。",
                         tool_call_id=tc["id"],
                     )
                 else:
@@ -178,6 +196,8 @@ def agent(state: AgentState) -> dict:
                         summary["old_len"] = len(args["old"])
                     if "new" in args:
                         summary["new_len"] = len(args["new"])
+                    if "code" in args:
+                        summary["code_len"] = len(args["code"])
                     tool_msg = ToolMessage(
                         content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
                         tool_call_id=tc["id"],
@@ -570,6 +590,34 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
 # ─────────────────────────── 主交互循环 ───────────────────────────
 
 
+# ─────────────────────────── step 回调注册机制（借鉴 smolagents step_callbacks） ───────────────────────────
+# 节点输出通过回调链处理，默认回调是 CLI 打印。
+# 外部（TUI/Web UI/测试）可注册自己的回调，无需修改核心逻辑。
+# 回调签名：fn(node_name: str, output: dict) -> None
+
+from collections.abc import Callable
+
+_step_callbacks: list[Callable[[str, dict], None]] = []
+
+
+def register_step_callback(fn: Callable[[str, dict], None]) -> None:
+    """注册一个节点输出回调。按注册顺序依次调用。"""
+    _step_callbacks.append(fn)
+
+
+def clear_step_callbacks() -> None:
+    """清空所有回调（测试用）。"""
+    _step_callbacks.clear()
+
+
+def _emit_step(node_name: str, output: dict) -> None:
+    for fn in _step_callbacks:
+        try:
+            fn(node_name, output)
+        except Exception:  # noqa: BLE001 — 回调异常不阻断主流程
+            pass
+
+
 def _print_node(node_name: str, output: dict) -> None:
     if node_name == "planner":
         plan = output.get("plan", [])
@@ -609,7 +657,7 @@ def run_round(graph, sess: Session, request: str) -> None:
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for node_name, output in chunk.items():
-                _print_node(node_name, output)
+                _emit_step(node_name, output)
     except Exception:
         traceback.print_exc()
 
@@ -644,12 +692,13 @@ def run_round(graph, sess: Session, request: str) -> None:
                         if node_name == "guard" and output.get("verdict") == "approved":
                             print(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}")
                         else:
-                            _print_node(node_name, output)
+                            _emit_step(node_name, output)
     _save_session_meta(sess)
 
 
 def run_interactive(graph, request: str | None = None) -> None:
     """多轮交互主循环：支持连续提需求 + 斜杠命令。"""
+    register_step_callback(_print_node)  # 默认回调：CLI 打印
     sess = Session()
     if request:
         run_round(graph, sess, request)

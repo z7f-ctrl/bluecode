@@ -33,6 +33,24 @@ _BLOCKED_COMMAND_PATTERNS = [
 
 _DEFAULT_TIMEOUT = 60  # 命令默认超时（秒）
 
+# ─────────────────────────── 命令白名单（借鉴 smolagents 白名单安全模型） ───────────
+# BLUE_COMMAND_WHITELIST 为空/未设置 → 仅黑名单模式（现状，宽松）
+# 设置为逗号分隔的命令名后 → 白名单模式：命令的第一个 token 必须在名单内，否则拦截
+# 例：BLUE_COMMAND_WHITELIST="python3,pytest,ls,cat"
+_COMMAND_WHITELIST: set[str] = {
+    c.strip() for c in os.environ.get("BLUE_COMMAND_WHITELIST", "").split(",") if c.strip()
+}
+
+
+def _command_head(command: str) -> str:
+    """取命令第一个 token（去掉常见 env 前缀）。"""
+    tokens = command.strip().split()
+    # 跳过 VAR=value 前缀和 env 命令
+    i = 0
+    while i < len(tokens) and ("=" in tokens[i] and not tokens[i].startswith("-")) or tokens[i] == "env":
+        i += 1
+    return tokens[i] if i < len(tokens) else ""
+
 
 def _resolve(path: str) -> Path:
     """把相对路径解析到工作目录内，越界直接报错。"""
@@ -127,30 +145,157 @@ def plan_patch(path: str, old: str, new: str) -> str:
 
 
 def check_command_safety(command: str) -> None:
-    """危险命令校验：命中关键词/管道即抛 ValueError。两条路径都必须调用：
+    """命令安全校验：先黑名单关键词，再（若配置了）白名单。两条路径都必须调用：
     ① agent 节点暂存 plan_run_command 时（提前拦下）
     ② execute_change 审批后执行前（最后防线）"""
     for pat in _BLOCKED_COMMAND_PATTERNS:
         if pat.search(command):
             raise ValueError(f"命令含危险关键词 {pat.pattern}，已被拦截：{command}")
+    if _COMMAND_WHITELIST:
+        head = _command_head(command)
+        if head not in _COMMAND_WHITELIST:
+            raise ValueError(
+                f"命令 {head!r} 不在白名单内（BLUE_COMMAND_WHITELIST={sorted(_COMMAND_WHITELIST)}），已被拦截：{command}"
+            )
 
 
 @tool
 def plan_run_command(command: str) -> str:
     """【暂存】计划执行一条 shell 命令。不会真的执行，需要审批。
-    有危险关键词（rm -rf / 管道 sudo 等）会在审批前就被拦截。"""
+    有危险关键词（rm -rf / 管道 sudo 等）会在审批前就被拦截；
+    若配置了 BLUE_COMMAND_WHITELIST，则命令头必须在白名单内。"""
     check_command_safety(command)
     return f"plan_run_command(command={command!r}) 已暂存——等待审批。"
 
 
-# 只读工具：给 ToolNode 真正执行
-READ_ONLY_TOOLS = [list_files, read_file, grep]
+# ─────────────────────────── plan_run_python（借鉴 smolagents CodeAgent） ───────────
+# 模型直接写 Python 代码作为动作，一次可组合多个工具调用 + 控制流。
+# 安全：ast 静态检查（禁 import 白名单外模块 / 禁 dunder 属性访问）+
+#       受限 builtins + 操作计数上限，execute_change 执行前二次校验。
+
+import ast
+import io
+import contextlib
+
+_PYTHON_ALLOWED_IMPORTS = {
+    "re", "json", "math", "os", "pathlib", "collections", "itertools",
+    "functools", "datetime", "subprocess",
+}
+_PYTHON_MAX_OPERATIONS = 100_000  # ast 节点数上限，防巨型代码
+_PYTHON_TIMEOUT = 30  # 秒
+
+
+class _OperationCounter(ast.NodeVisitor):
+    """统计 ast 节点数，超 _PYTHON_MAX_OPERATIONS 拒绝。"""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def generic_visit(self, node):
+        self.count += 1
+        if self.count > _PYTHON_MAX_OPERATIONS:
+            raise ValueError(f"代码过大（ast 节点数 > {_PYTHON_MAX_OPERATIONS}）")
+        super().generic_visit(node)
+
+
+def check_python_safety(code: str) -> None:
+    """Python 代码静态安全检查：
+    - 仅允许 import _PYTHON_ALLOWED_IMPORTS 内的模块
+    - 禁止访问 __xxx__ dunder 属性（防沙箱逃逸）
+    - ast 节点数上限
+    两条路径都必须调用：① agent 暂存时 ② execute_change 执行前。"""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise ValueError(f"Python 语法错误：{exc}") from exc
+    _OperationCounter().visit(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                [a.name.split(".")[0] for a in node.names]
+                if isinstance(node, ast.Import)
+                else [(node.module or "").split(".")[0]]
+            )
+            for mod in names:
+                if mod and mod not in _PYTHON_ALLOWED_IMPORTS:
+                    raise ValueError(f"禁止导入模块 {mod!r}（白名单：{sorted(_PYTHON_ALLOWED_IMPORTS)}）")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                raise ValueError(f"禁止访问 dunder 属性 {node.attr!r}")
+
+
+@tool
+def plan_run_python(code: str) -> str:
+    """【暂存】计划在工作目录内执行一段 Python 代码。不会真的执行，需要审批。
+    适用：一次组合多个文件操作/数据处理/控制流，比多次 plan_run_command 省轮次。
+    限制：仅可导入 re/json/math/os/pathlib/collections/itertools/functools/datetime/subprocess，
+    禁止 __dunder__ 属性访问，30s 超时，输出截断 3000 字符。"""
+    check_python_safety(code)
+    return f"plan_run_python(code_len={len(code)}) 已暂存——等待审批。"
+
+
+def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """受限 __import__：只允许 _PYTHON_ALLOWED_IMPORTS 内的模块。"""
+    root = name.split(".")[0]
+    if root not in _PYTHON_ALLOWED_IMPORTS:
+        raise ImportError(f"禁止导入模块 {root!r}（白名单：{sorted(_PYTHON_ALLOWED_IMPORTS)}）")
+    import builtins as _b
+    return _b.__import__(name, globals, locals, fromlist, level)
+
+
+def _restricted_builtins() -> dict:
+    """受限 builtins：保留常用安全函数 + 受限 __import__，剔除 open/eval/exec。"""
+    import builtins as _b
+
+    safe_names = [
+        "abs", "all", "any", "bin", "bool", "chr", "dict", "dir", "divmod",
+        "enumerate", "filter", "float", "format", "frozenset", "getattr",
+        "hasattr", "hash", "hex", "int", "isinstance", "issubclass", "iter",
+        "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
+        "print", "range", "repr", "reversed", "round", "set", "setattr",
+        "slice", "sorted", "str", "sum", "tuple", "type", "zip", "Exception",
+        "ValueError", "TypeError", "KeyError", "IndexError", "StopIteration",
+        "True", "False", "None",
+    ]
+    d = {n: getattr(_b, n) for n in safe_names if hasattr(_b, n)}
+    d["__import__"] = _restricted_import
+    return d
+
+
+def _execute_python(code: str) -> str:
+    """在受限命名空间执行已审批的 Python 代码，捕获 stdout。"""
+    check_python_safety(code)  # 最后防线
+    namespace: dict = {"__builtins__": _restricted_builtins()}
+    # 注入受限的工作目录上下文
+    namespace["WORKDIR"] = WORKDIR
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            exec(compile(code, "<plan_run_python>", "exec"), namespace)  # noqa: S102
+    except Exception as exc:  # noqa: BLE001 — 沙箱内异常全部回吐给模型
+        return f"执行失败：{type(exc).__name__}: {exc}\nstdout:\n{stdout.getvalue()[-3000:]}"
+    out = stdout.getvalue()
+    return f"执行成功\n{out[-3000:]}" if out else "执行成功（无输出）"
+
+
+@tool
+def final_answer(answer: str) -> str:
+    """任务完成时调用，给出最终答复摘要。调用后本轮 agent 循环立即终止。
+    只读工具，免审批。必须在确认任务完成后调用，不要在还有工具未执行时使用。"""
+    return f"final_answer: {answer}"
+
+
+# 只读工具：给 ToolNode 真正执行（final_answer 虽触发终止，但本身无副作用，归只读）
+READ_ONLY_TOOLS = [list_files, read_file, grep, final_answer]
 
 # 全部工具：供模型绑定（绑定后才知道有哪些工具可调用）
-ALL_TOOLS = READ_ONLY_TOOLS + [plan_write_file, plan_patch, plan_run_command]
+ALL_TOOLS = READ_ONLY_TOOLS + [plan_write_file, plan_patch, plan_run_command, plan_run_python]
 
 # 暂存类工具名集合：agent 节点据此把它们从 pending_changes
-PLAN_TOOL_NAMES = {plan_write_file.name, plan_patch.name, plan_run_command.name}
+PLAN_TOOL_NAMES = {plan_write_file.name, plan_patch.name, plan_run_command.name, plan_run_python.name}
+
+# 终止类工具名：agent 循环见到即 break
+FINAL_ANSWER_TOOL = final_answer.name
 
 
 # ─────────────────────────── 审批通过后的真正执行 ───────────────────────────
@@ -195,6 +340,9 @@ def execute_change(change: dict) -> str:
             if result.returncode != 0:
                 return f"命令退出码 {result.returncode}\nstdout:\n{out}\nstderr:\n{err}"
             return f"命令成功（退出码 0）\n{out}\n{err}".strip()
+
+        if action == "plan_run_python":
+            return _execute_python(change["code"])
 
         return f"未知动作 {action}"
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
