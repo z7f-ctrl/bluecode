@@ -42,9 +42,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
 
-from prompts import AGENT_PROMPT, PLANNER_PROMPT, REPORT_PROMPT, REVIEWER_PROMPT
+from prompts import AGENT_PROMPT, PLANNER_PROMPT, REPORT_PROMPT, REVIEWER_PROMPT, WORKER_PROMPT
 from tools import (
     ALL_TOOLS,
     FINAL_ANSWER_TOOL,
@@ -58,8 +58,19 @@ from tools import (
 
 MAX_REVIEW_ROUNDS = 3
 MAX_TOOL_ITERATIONS = 15
+MAX_WORKER_ITERATIONS = 8   # 并行 worker 的工具循环上限（比串行 agent 小，防限流下耗时失控）
+MAX_PARALLEL_WORKERS = 4    # 并行 worker 数量上限（实测 API 限流，不宜更高）
 BLUE_DIR = os.path.expanduser("~/.blue")
 DB_PATH = os.path.join(BLUE_DIR, "checkpoints.sqlite")
+
+
+def _resettable_add(old: list, new: list) -> list:
+    """reducer：空列表 = 显式清空；非空 = 追加。
+
+    并行 worker 的产出经它聚合（LangGraph 并行分支写同一 key 必须有 reducer），
+    guard 执行后 / planner 新需求时返回 [] 完成重置。
+    """
+    return [] if new == [] else old + new
 
 
 class AgentState(TypedDict):
@@ -67,10 +78,13 @@ class AgentState(TypedDict):
     request: str
     plan: list[str]
     current_step: int
-    pending_changes: list[dict]
+    pending_changes: Annotated[list[dict], _resettable_add]
     review_rounds: int
     verdict: str
     feedback: str
+    parallel_tasks: list[str]        # planner 产出的可并行子任务（空 = 走串行 agent）
+    current_subtask: str             # Send 注入给单个 worker 的子任务描述
+    worker_notes: Annotated[list[str], _resettable_add]  # 各 worker 的一句话总结，聚合
 
 
 def initial_state(request: str) -> AgentState:
@@ -83,6 +97,9 @@ def initial_state(request: str) -> AgentState:
         "review_rounds": 0,
         "verdict": "proceed",
         "feedback": "",
+        "parallel_tasks": [],
+        "current_subtask": "",
+        "worker_notes": [],
     }
 
 
@@ -90,18 +107,36 @@ tool_node = ToolNode(READ_ONLY_TOOLS)
 
 
 _model_cache: ChatOpenAI | None = None
+_plain_model_cache: ChatOpenAI | None = None
+
+
+def _base_kwargs() -> dict:
+    kwargs: dict = {"model": os.environ.get("MODEL_NAME", "gpt-4o-mini")}
+    if os.environ.get("OPENAI_BASE_URL"):
+        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+    if os.environ.get("OPENAI_API_KEY"):
+        kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
+    return kwargs
 
 
 def _make_model() -> ChatOpenAI:
+    """带工具绑定的模型，供 agent / worker 的工具循环用。"""
     global _model_cache
     if _model_cache is None:
-        kwargs: dict = {"model": os.environ.get("MODEL_NAME", "gpt-4o-mini")}
-        if os.environ.get("OPENAI_BASE_URL"):
-            kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
-        if os.environ.get("OPENAI_API_KEY"):
-            kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
-        _model_cache = ChatOpenAI(**kwargs).bind_tools(ALL_TOOLS)
+        _model_cache = ChatOpenAI(**_base_kwargs()).bind_tools(ALL_TOOLS)
     return _model_cache
+
+
+def _make_plain_model() -> ChatOpenAI:
+    """不绑工具的模型，供 planner / reviewer / report 等纯文本节点用。
+
+    绑工具的模型对纯文本 prompt 可能以 tool_calls 代替文本输出（K3 实测：
+    finish_reason=tool_calls、content 为空），导致 planner JSON 解析退化为单步。
+    """
+    global _plain_model_cache
+    if _plain_model_cache is None:
+        _plain_model_cache = ChatOpenAI(**_base_kwargs())
+    return _plain_model_cache
 
 
 def should_skip_planner(request: str) -> bool:
@@ -118,19 +153,35 @@ def should_skip_planner(request: str) -> bool:
 
 def planner(state: AgentState) -> dict:
     if should_skip_planner(state["request"]):
-        return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed"}
-    resp = _make_model().invoke(
+        return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed",
+                "parallel_tasks": [], "worker_notes": []}
+    resp = _make_plain_model().invoke(
         [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])]
     )
     content = resp.content
+    plan: list | None = None
+    parallel: list[str] = []
     try:
         parsed = json.loads(content) if isinstance(content, str) else content
-        plan = parsed if isinstance(parsed, list) else parsed.get("steps")
+        if isinstance(parsed, list):
+            # 旧格式兼容：纯数组 = 串行步骤
+            plan = parsed
+        elif isinstance(parsed, dict):
+            plan = parsed.get("steps")
+            raw_parallel = parsed.get("parallel_tasks") or []
+            if isinstance(raw_parallel, list):
+                seen: set[str] = set()
+                for t in raw_parallel:
+                    if isinstance(t, str) and t.strip() and t not in seen:
+                        seen.add(t)
+                        parallel.append(t)
+                parallel = parallel[:MAX_PARALLEL_WORKERS]
     except Exception:
         plan = None
     if not isinstance(plan, list) or not all(isinstance(p, str) for p in plan):
         plan = [state["request"]]
-    return {"plan": plan, "current_step": 0, "verdict": "proceed"}
+    return {"plan": plan, "current_step": 0, "verdict": "proceed",
+            "parallel_tasks": parallel, "worker_notes": []}
 
 
 def agent(state: AgentState) -> dict:
@@ -144,7 +195,9 @@ def agent(state: AgentState) -> dict:
     messages.append(HumanMessage(content=tip))
 
     updated: list = []
-    pending: list[dict] = list(state.get("pending_changes", []))
+    # delta 语义：pending_changes 有 _resettable_add reducer，这里只收集本轮新增，
+    # reducer 负责追加到 state；若从 state 复制再返回全量会导致重复累加。
+    pending: list[dict] = []
     step = state.get("current_step", 0)
     iterations = 0
 
@@ -220,9 +273,68 @@ def agent(state: AgentState) -> dict:
     return {"messages": updated, "pending_changes": pending, "current_step": step}
 
 
+def worker(state: AgentState) -> dict:
+    """并行 worker：处理 planner 派生的一个独立子任务，只读 + 暂存，不真执行。
+
+    与 agent 节点同构的精简工具循环；不写 messages（并行分支消息会交错混乱），
+    产出（pending_changes / worker_notes）经 _resettable_add reducer 聚合。
+    """
+    subtask = state["current_subtask"]
+    messages: list = [
+        SystemMessage(content=WORKER_PROMPT),
+        HumanMessage(content=f"总需求：{state['request']}\n你负责的子任务：{subtask}"),
+    ]
+    pending: list[dict] = []
+
+    for _ in range(MAX_WORKER_ITERATIONS):
+        ai: AIMessage = _make_model().invoke(messages)
+        messages.append(ai)
+        if not ai.tool_calls:
+            break
+        for tc in ai.tool_calls:
+            name, args = tc.get("name"), tc.get("args") or {}
+            if name == FINAL_ANSWER_TOOL:
+                # 拿到总结即返回，不再 invoke，无需补 ToolMessage
+                note = args.get("answer", "") or "完成"
+                return {"pending_changes": pending,
+                        "worker_notes": [f"「{subtask}」{note}"]}
+            if name in PLAN_TOOL_NAMES:
+                # 与 agent 节点一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
+                blocked = None
+                if name == "plan_run_command":
+                    try:
+                        check_command_safety(args.get("command", ""))
+                        _resolve(args.get("cwd", "."))
+                    except ValueError as exc:
+                        blocked = str(exc)
+                elif name == "plan_run_python":
+                    try:
+                        check_python_safety(args.get("code", ""))
+                    except ValueError as exc:
+                        blocked = str(exc)
+                if blocked:
+                    messages.append(ToolMessage(
+                        content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"]))
+                    continue
+                pending.append({"action": name, **args})
+                summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
+                messages.append(ToolMessage(
+                    content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
+                    tool_call_id=tc["id"]))
+            else:
+                tool_messages = tool_node.invoke(messages)
+                tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
+                messages.extend(tool_messages)
+        if pending:
+            break
+    note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
+    return {"pending_changes": pending, "worker_notes": [f"「{subtask}」{note}"]}
+
+
 def guard(state: AgentState) -> dict:
     if not state.get("pending_changes"):
-        return {"verdict": "proceed", "pending_changes": [], "feedback": ""}
+        notes = "；".join(state.get("worker_notes", []))
+        return {"verdict": "proceed", "pending_changes": [], "feedback": notes}
     answer = interrupt({"changes": state["pending_changes"], "question": "以上改动/命令是否允许执行？"})
     action = answer.get("action") if isinstance(answer, dict) else "approve"
     if action == "reject":
@@ -234,6 +346,8 @@ def guard(state: AgentState) -> dict:
     summary = "\n".join(execute_change(c) for c in state["pending_changes"])
     if changed_files:
         summary += f"\n\n【改动文件】{'; '.join(changed_files)}"
+    if state.get("worker_notes"):
+        summary += "\n\n【并行子任务】\n" + "\n".join(state["worker_notes"])
     return {"verdict": "approved", "pending_changes": [], "feedback": summary}
 
 
@@ -314,12 +428,17 @@ def verifier(state: AgentState) -> dict:
                 results.append(f"? {path} 语法检查异常：{exc}")
 
     # 2. 尝试发现测试并执行（如果项目里有测试文件）
+    # 排除 benchmark 题库：那里是故意带 bug 的题目，跑它们只会得到必挂的噪音，
+    # 还会误导 reviewer 打回（真机实测：项目根跑无关需求被 benchmarks/tasks 污染）
+    EXCLUDED_TEST_PARTS = ("benchmarks/quixbugs/tasks", "__pycache__")
     test_files = []
     try:
-        for item in _resolve(".").rglob("test_*.py"):
-            test_files.append(str(item.relative_to(_resolve("."))))
-        for item in _resolve(".").rglob("*_test.py"):
-            test_files.append(str(item.relative_to(_resolve("."))))
+        for pattern in ("test_*.py", "*_test.py"):
+            for item in _resolve(".").rglob(pattern):
+                rel = str(item.relative_to(_resolve(".")))
+                if any(ex in rel for ex in EXCLUDED_TEST_PARTS):
+                    continue
+                test_files.append(rel)
     except Exception:
         pass
 
@@ -359,7 +478,7 @@ def reviewer(state: AgentState) -> dict:
     if verdict == "proceed":
         return {"verdict": "pass", "feedback": "本次为只读任务，无需改动。", "review_rounds": rounds + 1}
 
-    resp = _make_model().invoke(
+    resp = _make_plain_model().invoke(
         [
             SystemMessage(content=REVIEWER_PROMPT),
             HumanMessage(
@@ -397,7 +516,7 @@ def reviewer(state: AgentState) -> dict:
 
 
 def report(state: AgentState) -> dict:
-    resp = _make_model().invoke(
+    resp = _make_plain_model().invoke(
         [
             SystemMessage(content=REPORT_PROMPT),
             HumanMessage(
@@ -417,6 +536,14 @@ def route_by_verdict(state: AgentState) -> Literal["agent", "report"]:
     return "agent" if state.get("verdict") == "revise" else "report"
 
 
+def route_after_planner(state: AgentState):
+    """planner 之后：有可并行子任务（≥2）则 Send 扇出 worker，否则走串行 agent。"""
+    tasks = state.get("parallel_tasks") or []
+    if len(tasks) >= 2:
+        return [Send("worker", {**state, "current_subtask": t}) for t in tasks]
+    return "agent"
+
+
 def _ensure_blue_dir() -> None:
     os.makedirs(BLUE_DIR, exist_ok=True)
 
@@ -434,13 +561,16 @@ def build_graph(checkpointer=None):
     builder = StateGraph(AgentState)
     builder.add_node("planner", planner)
     builder.add_node("agent", agent)
+    builder.add_node("worker", worker)
     builder.add_node("guard", guard)
     builder.add_node("verifier", verifier)
     builder.add_node("reviewer", reviewer)
     builder.add_node("report", report)
     builder.add_edge(START, "planner")
-    builder.add_edge("planner", "agent")
+    # planner 后条件扇出：parallel_tasks ≥ 2 → 并行 worker，否则串行 agent
+    builder.add_conditional_edges("planner", route_after_planner, ["agent", "worker"])
     builder.add_edge("agent", "guard")
+    builder.add_edge("worker", "guard")  # join：所有并行 worker 完成后 guard 执行一次
     builder.add_edge("guard", "verifier")
     builder.add_edge("verifier", "reviewer")
     builder.add_conditional_edges(
@@ -621,22 +751,34 @@ def _emit_step(node_name: str, output: dict) -> None:
             pass
 
 
+def _print_pending(prefix: str, changes: list[dict]) -> None:
+    """打印暂存的改动清单（agent 与 worker 共用）。"""
+    for c in changes:
+        shown = {k: v for k, v in c.items() if k != "action"}
+        # 大字段只显示长度，不打印完整内容
+        for big in ("content", "old", "new"):
+            if big in shown:
+                shown[f"{big}_len"] = len(shown.pop(big))
+        print(f"{prefix} 已暂存待审批 → {c['action']}({json.dumps(shown, ensure_ascii=False)})")
+
+
 def _print_node(node_name: str, output: dict) -> None:
     if node_name == "planner":
         plan = output.get("plan", [])
+        parallel = output.get("parallel_tasks") or []
+        if len(parallel) >= 2:
+            print(f"[蓝] 拆出 {len(parallel)} 个独立子任务，并行 worker 处理：{json.dumps(parallel, ensure_ascii=False)}")
         # planner 条件化：单步且与需求原文一致 → 简单需求直接执行
-        if len(plan) == 1:
+        elif len(plan) == 1:
             print("[蓝] 简单需求，直接执行")
         else:
             print(f"[蓝] 计划：{json.dumps(plan, ensure_ascii=False)}")
     elif node_name == "agent" and output.get("pending_changes"):
-        for c in output["pending_changes"]:
-            shown = {k: v for k, v in c.items() if k != "action"}
-            # 大字段只显示长度，不打印完整内容
-            for big in ("content", "old", "new"):
-                if big in shown:
-                    shown[f"{big}_len"] = len(shown.pop(big))
-            print(f"[蓝] 已暂存待审批 → {c['action']}({json.dumps(shown, ensure_ascii=False)})")
+        _print_pending("[蓝]", output["pending_changes"])
+    elif node_name == "worker":
+        _print_pending("[蓝·worker]", output.get("pending_changes", []))
+        for note in output.get("worker_notes", []):
+            print(f"[蓝·worker] {note}")
     elif node_name == "guard":
         print(f"[蓝] 审批结果：{output.get('verdict')}")
     elif node_name == "verifier":

@@ -2,6 +2,7 @@
 
 注意：离线测试使用 MemorySaver + 临时 sqlite 文件，避免污染真实 ~/.blue/checkpoints.sqlite。
 """
+import json
 import os
 import tempfile
 from unittest.mock import patch
@@ -44,6 +45,7 @@ def run_on(model_fake, request, resume_action=None, thread_id="test-1"):
     state = agent.initial_state(request)
     order = []
     with patch("agent._make_model", lambda: model_fake), \
+         patch("agent._make_plain_model", lambda: model_fake), \
          patch("agent.should_skip_planner", lambda r: False):
         # 首轮
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
@@ -200,6 +202,7 @@ def test_multi_round_same_thread():
         state = agent.initial_state(request)
         order = []
         with patch("agent._make_model", lambda: model_fake), \
+             patch("agent._make_plain_model", lambda: model_fake), \
              patch("agent.should_skip_planner", lambda r: False):
             for chunk in graph.stream(state, config=config, stream_mode="updates"):
                 for n, _o in chunk.items():
@@ -319,7 +322,9 @@ def test_skip_planner_for_simple_request():
     config: RunnableConfig = {"configurable": {"thread_id": "skip-test"}}
     state = agent.initial_state("统计 hello 出现次数")
     order = []
-    with patch("agent._make_model", lambda: FakeModel(calls)):
+    fake = FakeModel(calls)  # 两个 patch 必须共享同一实例，否则各持 seq 副本导致序列错位
+    with patch("agent._make_model", lambda: fake), \
+         patch("agent._make_plain_model", lambda: fake):
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for n, _o in chunk.items():
                 order.append(n)
@@ -339,6 +344,52 @@ def test_skip_planner_for_simple_request():
     print("PASS skip planner for simple request ✔\n")
 
 
+def test_parallel_workers_fanout():
+    """planner 产出 parallel_tasks ≥2 → Send 扇出并行 worker，改动经 reducer 聚合到 guard 一次审批。"""
+    alpha, beta = "__scratch_alpha__.txt", "__scratch_beta__.txt"
+
+    class FakeByContent:
+        """并行 worker 的模型调用次序不确定，按消息内容路由脚本化响应。"""
+        def invoke(self, messages, *a, **k):
+            sys_prompt = str(messages[0].content) if messages else ""
+            if "计划节点" in sys_prompt:
+                return AIMessage(content=json.dumps({
+                    "steps": ["并行写两个文件"],
+                    "parallel_tasks": [f"写入 {alpha}", f"写入 {beta}"],
+                }))
+            if "评审节点" in sys_prompt:
+                return AIMessage(content="verdict: pass\nfeedback: 并行改动没问题。")
+            if "收尾节点" in sys_prompt:
+                return AIMessage(content="# 报告\n两个文件并行完成。")
+            joined = "\n".join(str(m.content) for m in messages)
+            # 必须按"你负责的子任务："行路由——总需求里同时提及两个文件，直接全文匹配会撞车
+            sub_line = next((l for l in joined.split("\n") if "你负责的子任务：" in l), "")
+            if alpha in sub_line:
+                return AIMessage(content="暂存 alpha", tool_calls=[
+                    {"name": "plan_write_file", "args": {"path": alpha, "content": "alpha 内容\n"}, "id": "wa"}])
+            if beta in sub_line:
+                return AIMessage(content="暂存 beta", tool_calls=[
+                    {"name": "plan_write_file", "args": {"path": beta, "content": "beta 内容\n"}, "id": "wb"}])
+            raise AssertionError("FakeByContent 未匹配到任何分支")
+
+    try:
+        order, state = run_on(FakeByContent(), f"并行写入 {alpha} 和 {beta}",
+                              resume_action={"action": "approve"})
+        print("parallel node order:", "→".join(order))
+        assert "worker" in order, "应扇出到并行 worker"
+        assert "agent" not in order, "并行路径不应走串行 agent"
+        assert state["verdict"] == "pass"
+        assert state["pending_changes"] == [], "审批后应清空 pending_changes"
+        assert len(state["worker_notes"]) == 2, f"两个 worker 的 notes 应聚合，实际 {state['worker_notes']}"
+        assert open(alpha, encoding="utf-8").read() == "alpha 内容\n", "worker A 的改动应落盘"
+        assert open(beta, encoding="utf-8").read() == "beta 内容\n", "worker B 的改动应落盘"
+        print("PASS parallel workers fanout（Send 扇出 + reducer 聚合 + 一次审批）✔\n")
+    finally:
+        for f in (alpha, beta):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -350,6 +401,7 @@ if __name__ == "__main__":
         test_session_meta_persistence()
         test_revise_compresses_messages()
         test_skip_planner_for_simple_request()
+        test_parallel_workers_fanout()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
