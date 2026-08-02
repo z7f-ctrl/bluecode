@@ -748,6 +748,7 @@ def main() -> None:
     parser.add_argument("request", nargs="?", default=None, help='要做的事，例如 "给 hello.py 加错误处理并写测试"')
     parser.add_argument("--show-graph", action="store_true", help="打印图拓扑后退出")
     parser.add_argument("--resume", action="store_true", help="恢复历史会话")
+    parser.add_argument("--auto-approve", action="store_true", help="benchmark 模式：guard 自动审批通过，不中断等待人工")
     args = parser.parse_args()
 
     graph = build_graph()
@@ -769,7 +770,39 @@ def main() -> None:
                 run_interactive(graph)
             return
         # 用户取消或无效 → 落入新会话
+    if args.auto_approve:
+        # benchmark 模式：非交互，单轮，guard 自动通过
+        register_step_callback(_print_node)
+        sess = Session()
+        run_round_auto(graph, sess, args.request or "")
+        return
     run_interactive(graph, args.request)
+
+
+def run_round_auto(graph, sess: Session, request: str) -> None:
+    """benchmark 模式：单轮执行，guard 自动 approve 不中断。"""
+    config = sess.config
+    state = initial_state(request)
+    print(f"[蓝] ★ benchmark 模式收到：{request}")
+    try:
+        for chunk in graph.stream(state, config=config, stream_mode="updates"):
+            for node_name, output in chunk.items():
+                _emit_step(node_name, output)
+    except Exception:
+        traceback.print_exc()
+
+    # 自动审批所有 interrupt
+    while True:
+        cur = graph.get_state(config)
+        if not cur.next:
+            break
+        for task in cur.tasks:
+            if task.interrupts:
+                print("[蓝] ⏸ 自动审批通过")
+                for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
+                    for node_name, output in chunk.items():
+                        _emit_step(node_name, output)
+    _save_session_meta(sess)
 
 
 if __name__ == "__main__":
