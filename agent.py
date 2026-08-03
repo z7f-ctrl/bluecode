@@ -1102,13 +1102,74 @@ def _print_change_approval(ci: int, ch: dict) -> None:
 
 
 def _print_changes_full(changes: list[dict]) -> None:
-    """[d] 详情：完整打印每条改动的全部内容（用户主动要求，不再截断）。"""
+    """[d] 详情：完整打印每条改动的全部内容（用户主动要求，不再截断）。
+    rich 可用时升级渲染：patch 红绿 unified diff、写文件/代码语法高亮（超 100 行分页）。"""
     for ci, ch in enumerate(changes, 1):
         print(_c(f"── 改动 {ci} [{ch['action']}] {'─' * 30}", _C.YELLOW))
+        if _RICH_CONSOLE is not None and _print_change_rich(ch):
+            print()
+            continue
         for k, v in ch.items():
             if k != "action":
                 print(f"{k}: {v}")
         print()
+
+
+try:  # rich 是软依赖：缺失时 fallback 纯文本，不影响主流程
+    from rich.console import Console
+    from rich.syntax import Syntax
+    from rich.text import Text
+    _RICH_CONSOLE: "Console | None" = Console()
+except ImportError:
+    _RICH_CONSOLE = None
+
+
+def _lex_for_path(path: str) -> str:
+    """按文件扩展名猜 pygments lexer（语法高亮用）。"""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return {
+        "py": "python", "js": "javascript", "ts": "typescript", "css": "css",
+        "html": "html", "json": "json", "md": "markdown", "sh": "bash",
+        "toml": "toml", "yaml": "yaml", "yml": "yaml",
+    }.get(ext, "text")
+
+
+def _print_change_rich(ch: dict) -> bool:
+    """用 rich 渲染单条改动详情。返回是否已渲染（False 时调用方 fallback 纯文本）。"""
+    console = _RICH_CONSOLE
+    action = ch["action"]
+    if action == "plan_patch":
+        import difflib
+        old_lines = str(ch.get("old", "")).splitlines(keepends=True)
+        new_lines = str(ch.get("new", "")).splitlines(keepends=True)
+        diff = difflib.unified_diff(old_lines, new_lines, fromfile="old", tofile="new")
+        text = Text()
+        for line in diff:
+            line = line.rstrip("\n")
+            if line.startswith("+") and not line.startswith("+++"):
+                text.append(line + "\n", style="green")
+            elif line.startswith("-") and not line.startswith("---"):
+                text.append(line + "\n", style="red")
+            elif line.startswith("@@"):
+                text.append(line + "\n", style="cyan")
+            else:
+                text.append(line + "\n")
+        console.print(f"path: {ch.get('path', '')}")
+        console.print(text)
+        return True
+    if action in ("plan_write_file", "plan_run_python"):
+        code = ch.get("content") if action == "plan_write_file" else ch.get("code")
+        lexer = _lex_for_path(ch.get("path", "")) if action == "plan_write_file" else "python"
+        syntax = Syntax(str(code), lexer, line_numbers=True, word_wrap=True)
+        if ch.get("path"):
+            console.print(f"path: {ch['path']}")
+        if str(code).count("\n") + 1 > 100:
+            with console.pager():  # 超 100 行分页（非 tty 时 rich 直接顺序输出，安全）
+                console.print(syntax)
+        else:
+            console.print(syntax)
+        return True
+    return False
 
 
 def _print_pending(prefix: str, changes: list[dict]) -> None:

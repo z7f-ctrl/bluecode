@@ -4,3 +4,4 @@ langchain-openai>=1.4
 langchain-core>=1.5
 grandalf  # 仅 draw_ascii() 打印拓扑需要
 python-dotenv  # 自动加载 .env 配置文件（不入库）
+rich  # 审批详情的 diff 渲染/语法高亮（软依赖：缺失时 fallback 纯文本）
