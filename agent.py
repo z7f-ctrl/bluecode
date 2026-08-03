@@ -478,9 +478,22 @@ def guard(state: AgentState) -> dict:
                 "executed_changes": [], "changed_files": []}
     # 执行前留存完整改动清单：reviewer 看 diff、report 列清单、verifier 读 changed_files。
     # pending_changes 随后清空，不存一份的话下游全拿不到改了什么（P1 实测坑）。
-    executed = list(state["pending_changes"])
+    # 逐条审批：resume 带 indices（0 起）时只执行批准的条目，跳过的记入 feedback。
+    all_changes = list(state["pending_changes"])
+    indices = answer.get("indices")
+    if isinstance(indices, list) and indices:
+        idx_set = {int(i) for i in indices}
+        executed = [c for i, c in enumerate(all_changes) if i in idx_set]
+        skipped = [c for i, c in enumerate(all_changes) if i not in idx_set]
+    else:
+        executed, skipped = all_changes, []
     changed_files = [c.get("path", "") for c in executed if c.get("path")]
     summary = "\n".join(execute_change(c) for c in executed)
+    if skipped:
+        skipped_desc = "; ".join(
+            f"{c.get('action')}({c.get('path') or c.get('command', '')})" for c in skipped
+        )
+        summary += f"\n\n【跳过】{len(skipped)} 条未获批准：{skipped_desc}"
     if changed_files:
         summary += f"\n\n【改动文件】{'; '.join(changed_files)}"
     if state.get("worker_notes"):
@@ -1304,13 +1317,21 @@ def run_round(graph, sess: Session, request: str) -> None:
                         return "n"
 
                 # [d] 详情：看完全文后回到审批提示，不计为决策
+                # 序号选批：1,3 → 只批这几条（resume 带 indices，guard 跳过其余）
+                resume_val = {"action": "approve"}
                 while True:
-                    choice = ask(_prompt("[y]允许 [n]拒绝 [m]修改意见 [d]详情 > ", _C.BRIGHT_CYAN))
+                    choice = ask(_prompt("[y]全批 [n]全拒 [m]意见 [d]详情 [序号]选批 > ", _C.BRIGHT_CYAN))
                     if choice == "d":
                         _print_changes_full(changes)
                         continue
+                    if re.fullmatch(r"[\d,\s]+", choice or "") and choice.strip(" ,"):
+                        nums = sorted({int(t) for t in re.split(r"[,\s]+", choice.strip()) if t})
+                        if nums and min(nums) >= 1 and max(nums) <= len(changes):
+                            resume_val = {"action": "approve", "indices": [n - 1 for n in nums]}
+                            break
+                        print(_c(f"  序号需在 1~{len(changes)} 之间，请重输。", _C.RED))
+                        continue
                     break
-                resume_val = {"action": "approve"}
                 if choice == "n":
                     resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
                 elif choice == "m":

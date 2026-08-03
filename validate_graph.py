@@ -34,6 +34,17 @@ class FakeModel:
         return AIMessage(content=item)
 
 
+class RecordingFake(FakeModel):
+    """FakeModel + 记录每次 invoke 收到的全部消息文本（断言 prompt 内容用）。"""
+    def __init__(self, sequence):
+        super().__init__(sequence)
+        self.inputs: list[str] = []
+
+    def invoke(self, messages, *a, **k):
+        self.inputs.append("\n".join(str(m.content) for m in messages))
+        return super().invoke(messages, *a, **k)
+
+
 def run_on(model_fake, request, resume_action=None, thread_id="test-1"):
     """跑一个 thread，遇 interrupt 用 resume_action 续命。返回 (node顺序, 最终state)。
 
@@ -608,16 +619,6 @@ def test_report_gets_executed_changes():
 
     此前 report 传 state['pending_changes']（guard 审批后必为 []），改动清单永远为空；
     reviewer 也只看执行结果文本看不到 diff。test_report_template 只覆盖只读分支，没抓到这个。"""
-    class RecordingFake:
-        def __init__(self, seq):
-            self.seq = list(seq)
-            self.inputs: list[str] = []
-
-        def invoke(self, messages, *a, **k):
-            self.inputs.append("\n".join(str(m.content) for m in messages))
-            item = self.seq.pop(0) if self.seq else AIMessage(content="done")
-            return item if isinstance(item, AIMessage) else AIMessage(content=item)
-
     scratch = "__scratch_report_changes__.txt"
     try:
         calls = [
@@ -677,6 +678,39 @@ def test_audit_log():
                 os.remove(scratch)
 
 
+def test_selective_approval():
+    """逐条审批：3 条改动选批 1,3 → 只执行 2 条，跳过记录进 reviewer 视野。"""
+    a, b, c = "__scratch_sa_a__.txt", "__scratch_sa_b__.txt", "__scratch_sa_c__.txt"
+    calls = [
+        AIMessage(content='["写三文件"]'),
+        AIMessage(content="写三个", tool_calls=[
+            {"name": "plan_write_file", "args": {"path": a, "content": "A\n"}, "id": "w1"},
+            {"name": "plan_write_file", "args": {"path": b, "content": "B\n"}, "id": "w2"},
+            {"name": "plan_write_file", "args": {"path": c, "content": "C\n"}, "id": "w3"},
+        ]),
+        AIMessage(content="verdict: pass\nfeedback: 部分批准。"),
+        AIMessage(content="# 报告\n完成。"),
+    ]
+    fake = RecordingFake(calls)
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="sa-test")
+    try:
+        with patch("agent._make_model", lambda: fake), \
+             patch("agent._make_plain_model", lambda: fake), \
+             patch("agent.should_skip_planner", lambda r: False), \
+             patch("builtins.input", lambda *a, **k: "1,3"):  # 选批第 1、3 条
+            agent.run_round(graph, sess, "写三个文件")
+        assert os.path.exists(a) and os.path.exists(c), "选批的 1,3 应执行"
+        assert not os.path.exists(b), "未选的 2 不应执行"
+        reviewer_input = next((t for t in fake.inputs if "评审轮数" in t), "")
+        assert "【跳过】" in reviewer_input, f"reviewer 应看到跳过记录：{reviewer_input[-200:]}"
+        print("PASS selective approval（选批 1,3 + 未选不执行 + 跳过记录进 reviewer）✔\n")
+    finally:
+        for f in (a, b, c):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -697,6 +731,7 @@ if __name__ == "__main__":
         test_token_usage_tracking()
         test_report_gets_executed_changes()
         test_audit_log()
+        test_selective_approval()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
