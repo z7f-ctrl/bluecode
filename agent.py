@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -80,6 +81,7 @@ def _resettable_add(old: list, new: list) -> list:
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     request: str
+    thread_id: str                     # 会话标识（guard 快照/审计等节点内需要）
     plan: list[str]
     current_step: int
     pending_changes: Annotated[list[dict], _resettable_add]
@@ -97,6 +99,7 @@ def initial_state(request: str) -> AgentState:
     return {
         "messages": [],
         "request": request,
+        "thread_id": "",
         "plan": [],
         "current_step": 0,
         "pending_changes": [],
@@ -488,7 +491,11 @@ def guard(state: AgentState) -> dict:
     else:
         executed, skipped = all_changes, []
     changed_files = [c.get("path", "") for c in executed if c.get("path")]
-    summary = "\n".join(execute_change(c) for c in executed)
+    # /undo 快照：必须在 execute_change 之前（备份的是改动前的内容）
+    snap_note = ""
+    if changed_files and _snapshot_files(changed_files, state.get("thread_id", ""), state["request"]):
+        snap_note = "\n\n【快照】改动前文件已备份（/undo 可回退；命令/Python 副作用不可撤）"
+    summary = "\n".join(execute_change(c) for c in executed) + snap_note
     if skipped:
         skipped_desc = "; ".join(
             f"{c.get('action')}({c.get('path') or c.get('command', '')})" for c in skipped
@@ -913,6 +920,7 @@ SLASH_HELP = """可用斜杠命令：
   /graph         打印图拓扑
   /resume        列出历史会话并恢复（等价于启动时 --resume）
   /new           强制开启新 thread（保留旧 checkpoint）
+  /undo          回退最近一次审批通过的文件改动（命令/Python 副作用不可撤）
 """
 
 
@@ -951,6 +959,9 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         return True, None
     if cmd == "/graph":
         print(graph.get_graph().draw_ascii())
+        return True, None
+    if cmd == "/undo":
+        print(_c(f"[蓝] ↩ {_undo_latest(sess.thread_id)}", _C.YELLOW))
         return True, None
     if cmd == "/resume":
         sessions = list_sessions()
@@ -1242,6 +1253,86 @@ def _round_cost_str(usage: dict) -> str:
 
 
 AUDIT_LOG = os.path.join(BLUE_DIR, "audit.jsonl")
+BACKUP_ROOT = os.path.join(BLUE_DIR, "backups")
+
+
+def _snapshot_files(files: list[str], thread_id: str, request: str) -> str | None:
+    """guard 执行前对改动文件做快照，供 /undo 恢复。返回快照时间戳（无文件则 None）。
+
+    已存在的文件复制内容（undo 写回）；不存在的新文件只记路径（undo 删除）。
+    边界：仅 plan_write_file/plan_patch 的目标文件在快照内；
+    plan_run_command / plan_run_python 的副作用不可撤。
+    """
+    files = [f for f in files if f]
+    if not files:
+        return None
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    tid = thread_id or "unknown"
+    snap_dir = os.path.join(BACKUP_ROOT, tid, ts)
+    saved, new_files = [], []
+    for rel in files:
+        try:
+            src = _resolve(rel)
+        except ValueError:
+            continue
+        if src.is_file():
+            dst = os.path.join(snap_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            saved.append(rel)
+        else:
+            new_files.append(rel)
+    os.makedirs(snap_dir, exist_ok=True)
+    meta = {"ts": ts, "request": request, "files": saved, "new_files": new_files,
+            "note": "仅文件改动可撤；plan_run_command/plan_run_python 的副作用不可撤"}
+    with open(os.path.join(snap_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(BACKUP_ROOT, tid, "latest"), "w", encoding="utf-8") as f:
+        f.write(ts)
+    return ts
+
+
+def _undo_latest(thread_id: str) -> str:
+    """恢复最近一次快照（单轮 latest 指针）。返回人可读的恢复报告。"""
+    tdir = os.path.join(BACKUP_ROOT, thread_id or "unknown")
+    latest_file = os.path.join(tdir, "latest")
+    if not os.path.isfile(latest_file):
+        return "没有可回退的快照（审批通过文件改动时会自动备份）。"
+    with open(latest_file, encoding="utf-8") as f:
+        ts = f.read().strip()
+    snap_dir = os.path.join(tdir, ts)
+    meta_path = os.path.join(snap_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return f"快照 {ts} 不完整（缺 meta.json），无法回退。"
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    restored, deleted, errors = [], [], []
+    for rel in meta.get("files", []):
+        try:
+            dst = _resolve(rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(os.path.join(snap_dir, rel), dst)
+            restored.append(rel)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{rel}: {exc}")
+    for rel in meta.get("new_files", []):
+        try:
+            p = _resolve(rel)
+            if p.exists():
+                p.unlink()
+                deleted.append(rel)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{rel}: {exc}")
+    os.remove(latest_file)  # 只撤一轮；快照目录保留在磁盘上可手动翻
+    lines = [f"已回退 {ts} 的改动（需求：{meta.get('request', '')[:50]}）"]
+    if restored:
+        lines.append(f"恢复 {len(restored)} 个文件：{'; '.join(restored)}")
+    if deleted:
+        lines.append(f"删除 {len(deleted)} 个新建文件：{'; '.join(deleted)}")
+    if errors:
+        lines.append(f"部分失败：{'; '.join(errors)}")
+    lines.append("注意：plan_run_command / plan_run_python 的副作用不在快照内，未回退。")
+    return "\n".join(lines)
 
 
 def _audit_log(sess: Session, decision: dict, changes: list[dict]) -> None:
@@ -1287,6 +1378,7 @@ def run_round(graph, sess: Session, request: str) -> None:
     """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
     config = sess.config
     state = initial_state(request)
+    state["thread_id"] = sess.thread_id
     _reset_token_usage()
     print(_c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE))
     try:
@@ -1441,6 +1533,7 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
     """benchmark 模式：单轮执行，guard 自动 approve 不中断。返回 final state values（CI 退出码判断用）。"""
     config = sess.config
     state = initial_state(request)
+    state["thread_id"] = sess.thread_id
     _reset_token_usage()
     print(_c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE))
     try:

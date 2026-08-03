@@ -15,9 +15,11 @@ from langgraph.checkpoint.memory import MemorySaver
 _TMP_DB = tempfile.NamedTemporaryFile(prefix="blue-test-", suffix=".sqlite", delete=False)
 _TMP_DB.close()
 os.environ.setdefault("BLUE_TEST_DB", _TMP_DB.name)
+_TMP_BACKUPS = tempfile.mkdtemp(prefix="blue-test-backups-")
 
 import agent
 agent.DB_PATH = os.environ["BLUE_TEST_DB"]
+agent.BACKUP_ROOT = _TMP_BACKUPS  # 快照/undo 同样隔离，不污染真实 ~/.blue/backups
 
 
 class FakeModel:
@@ -54,6 +56,7 @@ def run_on(model_fake, request, resume_action=None, thread_id="test-1"):
     graph = agent.build_graph(checkpointer=MemorySaver())
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     state = agent.initial_state(request)
+    state["thread_id"] = thread_id
     order = []
     with patch("agent._make_model", lambda: model_fake), \
          patch("agent._make_plain_model", lambda: model_fake), \
@@ -711,6 +714,48 @@ def test_selective_approval():
                 os.remove(f)
 
 
+def test_undo_snapshot_restore():
+    """/undo：guard 执行前自动快照，patch 回退到改动前、新建文件被删除、单轮指针。"""
+    scratch = "__scratch_undo__.txt"
+    new_file = "__scratch_undo_new__.txt"
+    with open(scratch, "w", encoding="utf-8") as f:
+        f.write("原始内容 v1\n")
+    calls = [
+        AIMessage(content='["改文件"]'),
+        AIMessage(content="改", tool_calls=[
+            {"name": "plan_patch", "args": {"path": scratch, "old": "v1", "new": "v2"}, "id": "w1"},
+            {"name": "plan_write_file", "args": {"path": new_file, "content": "新建\n"}, "id": "w2"},
+        ]),
+        AIMessage(content="verdict: pass\nfeedback: ok。"),
+        AIMessage(content="# 报告\n完成。"),
+    ]
+    fake = FakeModel(calls)
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="undo-test")
+    try:
+        with patch("agent._make_model", lambda: fake), \
+             patch("agent._make_plain_model", lambda: fake), \
+             patch("agent.should_skip_planner", lambda r: False), \
+             patch("builtins.input", lambda *a, **k: "y"):
+            agent.run_round(graph, sess, "改两个文件")
+        # 改动已生效
+        with open(scratch, encoding="utf-8") as f:
+            assert f.read() == "原始内容 v2\n", "patch 应已生效"
+        assert os.path.exists(new_file), "新文件应已创建"
+        # undo：patch 回退 + 新建删除
+        report = agent._undo_latest(sess.thread_id)
+        with open(scratch, encoding="utf-8") as f:
+            assert f.read() == "原始内容 v1\n", f"patch 应被回退：{report}"
+        assert not os.path.exists(new_file), f"新建文件应被删除：{report}"
+        # 再 undo 一次：单轮指针已消费
+        assert "没有可回退" in agent._undo_latest(sess.thread_id), "latest 指针应只撤一轮"
+        print("PASS undo（快照回退 patch + 删除新建 + 单轮指针）✔\n")
+    finally:
+        for f in (scratch, new_file):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -732,6 +777,7 @@ if __name__ == "__main__":
         test_report_gets_executed_changes()
         test_audit_log()
         test_selective_approval()
+        test_undo_snapshot_restore()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
@@ -743,3 +789,5 @@ if __name__ == "__main__":
         shm = _TMP_DB.name + "-shm"
         if os.path.exists(shm):
             os.unlink(shm)
+        import shutil as _sh
+        _sh.rmtree(_TMP_BACKUPS, ignore_errors=True)
