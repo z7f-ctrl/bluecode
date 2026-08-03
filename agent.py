@@ -1154,6 +1154,19 @@ def _print_node(node_name: str, output: dict) -> None:
         print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BLUE))
 
 
+def _round_cost_str(usage: dict) -> str:
+    """按单价配置算本轮成本串；未配置或配置非法返回空串（不影响播报）。"""
+    try:
+        pi = float(os.environ.get("PRICE_PER_1M_INPUT", "") or 0)
+        po = float(os.environ.get("PRICE_PER_1M_OUTPUT", "") or 0)
+    except ValueError:
+        return ""
+    if not (pi or po):
+        return ""
+    cost = usage["prompt"] * pi / 1e6 + usage["completion"] * po / 1e6
+    return f"｜≈ ${cost:.4f}"
+
+
 def _finish_round_usage(sess: Session) -> None:
     """一轮需求结束：汇总本轮 token 消耗，计入 Session 并播报。"""
     usage = _token_usage_snapshot()
@@ -1164,7 +1177,7 @@ def _finish_round_usage(sess: Session) -> None:
         sess_total = sess.token_usage["prompt"] + sess.token_usage["completion"]
         print(_c(
             f"[蓝] 📊 本轮 token：{usage['prompt']} + {usage['completion']} = {total}"
-            f"（{usage['calls']} 次调用）｜会话累计 {sess_total}",
+            f"（{usage['calls']} 次调用）{_round_cost_str(usage)}｜会话累计 {sess_total}",
             _C.DIM,
         ))
 
@@ -1306,13 +1319,16 @@ def main() -> None:
             parser.error("--auto-approve 需要同时提供需求（request），空需求没有可执行内容")
         register_step_callback(_print_node)
         sess = Session()
-        run_round_auto(graph, sess, args.request or "")
-        return
+        final = run_round_auto(graph, sess, args.request or "")
+        # CI 退出码：verdict 非 pass，或 verifier 报过 ✗（上限强制放行时 verdict
+        # 也是 pass，靠失败标记兜底）。用户主动拒绝=rejected→reviewer pass=exit 0。
+        failed = final.get("verdict") != "pass" or "✗" in str(final.get("feedback", ""))
+        sys.exit(1 if failed else 0)
     run_interactive(graph, args.request)
 
 
-def run_round_auto(graph, sess: Session, request: str) -> None:
-    """benchmark 模式：单轮执行，guard 自动 approve 不中断。"""
+def run_round_auto(graph, sess: Session, request: str) -> dict:
+    """benchmark 模式：单轮执行，guard 自动 approve 不中断。返回 final state values（CI 退出码判断用）。"""
     config = sess.config
     state = initial_state(request)
     _reset_token_usage()
@@ -1338,6 +1354,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
                         _emit_step(node_name, output)
     _finish_round_usage(sess)
     _save_session_meta(sess)
+    return graph.get_state(config).values
 
 
 if __name__ == "__main__":
