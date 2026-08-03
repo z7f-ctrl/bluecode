@@ -1167,6 +1167,33 @@ def _round_cost_str(usage: dict) -> str:
     return f"｜≈ ${cost:.4f}"
 
 
+AUDIT_LOG = os.path.join(BLUE_DIR, "audit.jsonl")
+
+
+def _audit_log(sess: Session, decision: dict, changes: list[dict]) -> None:
+    """审批决定追加写审计日志（含拒绝/修改意见；只追加，一行一条 jsonl）。
+
+    挂在 run_round / run_round_auto 的 resume 处而非 guard 节点内——
+    guard 拿不到 thread_id（state 里没有）。写入失败不阻断主流程。
+    """
+    try:
+        record: dict = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "thread": sess.thread_id,
+            "action": decision.get("action"),
+            "changes": [_shown_change(c) for c in changes],
+        }
+        if decision.get("indices") is not None:
+            record["indices"] = decision["indices"]
+        if decision.get("note"):
+            record["note"] = decision["note"]
+        os.makedirs(BLUE_DIR, exist_ok=True)
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — 审计是旁路，绝不阻断主流程
+        pass
+
+
 def _finish_round_usage(sess: Session) -> None:
     """一轮需求结束：汇总本轮 token 消耗，计入 Session 并播报。"""
     usage = _token_usage_snapshot()
@@ -1227,6 +1254,7 @@ def run_round(graph, sess: Session, request: str) -> None:
                     resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
                 elif choice == "m":
                     resume_val = {"action": "modify", "note": ask(_prompt("  修改意见 > ", _C.BRIGHT_CYAN))}
+                _audit_log(sess, resume_val, changes)
                 print()
                 for chunk in graph.stream(Command(resume=resume_val), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
@@ -1349,6 +1377,8 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
         for task in cur.tasks:
             if task.interrupts:
                 print(_c("[蓝] ⏸ 自动审批通过", _C.DIM))
+                _audit_log(sess, {"action": "auto-approve"},
+                           task.interrupts[0].value.get("changes", []))
                 for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
                         _emit_step(node_name, output)

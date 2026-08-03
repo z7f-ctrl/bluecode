@@ -641,6 +641,42 @@ def test_report_gets_executed_changes():
             os.remove(scratch)
 
 
+def test_audit_log():
+    """审批决定写 audit.jsonl：approve 一条记录，thread/动作/改动摘要/时间齐全。"""
+    scratch = "__scratch_audit__.txt"
+    with tempfile.TemporaryDirectory() as td:
+        audit_path = os.path.join(td, "audit.jsonl")
+        calls = [
+            AIMessage(content='["写"]'),
+            AIMessage(content="写", tool_calls=[
+                {"name": "plan_write_file", "args": {"path": scratch, "content": "audit 内容\n"}, "id": "w1"}]),
+            AIMessage(content="verdict: pass\nfeedback: ok。"),
+            AIMessage(content="# 报告\n完成。"),
+        ]
+        fake = FakeModel(calls)
+        graph = agent.build_graph(checkpointer=MemorySaver())
+        sess = agent.Session(thread_id="audit-test")
+        try:
+            with patch("agent.AUDIT_LOG", audit_path), \
+                 patch("agent._make_model", lambda: fake), \
+                 patch("agent._make_plain_model", lambda: fake), \
+                 patch("agent.should_skip_planner", lambda r: False), \
+                 patch("builtins.input", lambda *a, **k: "y"):  # 模拟审批按 y
+                agent.run_round(graph, sess, f"写入 {scratch}")
+            with open(audit_path, encoding="utf-8") as f:
+                recs = [json.loads(l) for l in f]
+            assert len(recs) == 1, f"应恰好一条审计记录，实际 {len(recs)}"
+            rec = recs[0]
+            assert rec["action"] == "approve" and rec["thread"] == "audit-test", f"审计字段错误：{rec}"
+            assert rec["changes"] and rec["changes"][0].get("path") == scratch, f"改动摘要错误：{rec}"
+            assert rec["changes"][0].get("content_len") == len("audit 内容\n"), "大字段应转长度（jsonl 不膨胀）"
+            assert rec["ts"], "应有时间戳"
+            print("PASS audit log（approve 记录 + 字段齐全 + 大字段转长度）✔\n")
+        finally:
+            if os.path.exists(scratch):
+                os.remove(scratch)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -660,6 +696,7 @@ if __name__ == "__main__":
         test_worker_fault_tolerance()
         test_token_usage_tracking()
         test_report_gets_executed_changes()
+        test_audit_log()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
