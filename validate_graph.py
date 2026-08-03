@@ -280,27 +280,32 @@ def test_session_meta_persistence():
 def test_revise_compresses_messages():
     """revise 回环时，reviewer 应把 messages 压缩成单条摘要。"""
     req = "改 hello.py 变量名"
+    scratch = "__scratch_rv_compress__.txt"
     calls = [
         AIMessage(content='["改 hello.py"]'),
         AIMessage(content="先读。", tool_calls=[
             {"name": "read_file", "args": {"path": "hello.py"}, "id": "r1"}]),
         AIMessage(content="准备写。", tool_calls=[
-            {"name": "plan_write_file", "args": {"path": "__rv__.txt", "content": "v1\n"}, "id": "w1"}]),
+            {"name": "plan_write_file", "args": {"path": scratch, "content": "v1\n"}, "id": "w1"}]),
         AIMessage(content="verdict: revise\nfeedback: 变量名太烂，回去改。"),
         AIMessage(content="已按意见重写。"),
         AIMessage(content="verdict: pass\nfeedback: 这版行了。"),
         AIMessage(content="# 报告\n完成。"),
     ]
-    order, state = run_on(FakeModel(calls), req, resume_action={"action": "approve"})
-    print("revise-compress order:", "→".join(order))
-    assert state["verdict"] == "pass"
-    # revise 回环后 messages 应被压缩成 1 条摘要
-    msgs = state.get("messages", [])
-    assert len(msgs) <= 2, f"revise 回环后 messages 应被压缩，实际 {len(msgs)} 条"
-    if msgs:
-        first = msgs[0].content if hasattr(msgs[0], "content") else str(msgs[0])
-        assert "【上一轮执行摘要】" in first or "摘要" in first, f"首条消息应为压缩摘要，实际：{first[:100]}"
-    print("PASS revise message compression ✔\n")
+    try:
+        order, state = run_on(FakeModel(calls), req, resume_action={"action": "approve"})
+        print("revise-compress order:", "→".join(order))
+        assert state["verdict"] == "pass"
+        # revise 回环后 messages 应被压缩成 1 条摘要
+        msgs = state.get("messages", [])
+        assert len(msgs) <= 2, f"revise 回环后 messages 应被压缩，实际 {len(msgs)} 条"
+        if msgs:
+            first = msgs[0].content if hasattr(msgs[0], "content") else str(msgs[0])
+            assert "【上一轮执行摘要】" in first or "摘要" in first, f"首条消息应为压缩摘要，实际：{first[:100]}"
+        print("PASS revise message compression ✔\n")
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
 
 
 def test_skip_planner_for_simple_request():
