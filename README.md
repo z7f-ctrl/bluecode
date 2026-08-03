@@ -173,8 +173,11 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.4 | QuixBugs benchmark（31 题修 bug 判分）+ `--auto-approve` 模式 | ✅ 已实现 |
 | v0.4.5 | reviewer 判定 fail-closed + 判分管线修复 + benchmark 扩至 40 题（+9 图算法）+ runner 并行 | ✅ 已实现 |
 | v0.5 | 多文件并行修改：`Send` 扇出 worker + reducer 聚合 + 一次性审批 | ✅ 已实现 |
-| v0.6 | LangGraph Studio 可视化调试 | 未实现 |
-| v0.7 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
+| v0.5.x | 日志两层 + token 追踪 + 滑动窗口 + 安全加固 + CLI 颜色 + executed_changes + 审批预览/详情 + 工具易用性 | ✅ 已实现 |
+| v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | 未实现 |
+| v0.7 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、权限分级 `.blue.toml`（allow/ask/deny）、`/retry` 失败恢复 | 未实现 |
+| v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
+| backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
 ## 安全说明（重要）
 
