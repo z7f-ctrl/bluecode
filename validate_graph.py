@@ -556,6 +556,48 @@ def test_worker_fault_tolerance():
                 os.remove(f)
 
 
+def test_token_usage_tracking():
+    """token 追踪：_logged_invoke 无条件累加，run_round 轮末汇总进 Session。"""
+    # _extract_usage 双来源：LangChain 标准 usage_metadata / OpenAI 原生 response_metadata
+    m1 = AIMessage(content="x", usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    m2 = AIMessage(content="x", response_metadata={"token_usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+    assert agent._extract_usage(m1) == (10, 5), f"usage_metadata 来源提取错误：{agent._extract_usage(m1)}"
+    assert agent._extract_usage(m2) == (7, 3), f"response_metadata 来源提取错误：{agent._extract_usage(m2)}"
+
+    # 只读一轮（planner + agent×2 = 3 次调用），fake 响应带 usage
+    def _u(p, c):
+        return {"token_usage": {"prompt_tokens": p, "completion_tokens": c}}
+    calls = [
+        AIMessage(content='["读"]', response_metadata=_u(100, 10)),
+        AIMessage(content="查", tool_calls=[{"name": "grep", "args": {"pattern": "x"}, "id": "g1"}],
+                  response_metadata=_u(200, 20)),
+        AIMessage(content="查完了", response_metadata=_u(300, 30)),
+    ]
+    fake = FakeModel(calls)
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="token-test")
+    with patch("agent._make_model", lambda: fake), \
+         patch("agent._make_plain_model", lambda: fake), \
+         patch("agent.should_skip_planner", lambda r: False):
+        agent.run_round(graph, sess, "只读需求")
+    t = sess.token_usage
+    assert t["calls"] == 3, f"应记 3 次调用，实际 {t}"
+    assert t["prompt"] == 600 and t["completion"] == 60, f"累计错误：{t}"
+    # 第二轮同一 Session：继续累加（会话级累计）。skip planner 后 agent 直接吃第一条响应
+    fake2 = FakeModel([
+        AIMessage(content="再查", tool_calls=[{"name": "grep", "args": {"pattern": "y"}, "id": "g2"}],
+                  response_metadata=_u(50, 5)),
+        AIMessage(content="收尾", response_metadata=_u(50, 5)),
+    ])
+    with patch("agent._make_model", lambda: fake2), \
+         patch("agent._make_plain_model", lambda: fake2), \
+         patch("agent.should_skip_planner", lambda r: True):  # 跳过 planner：agent×2
+        agent.run_round(graph, sess, "再来一个只读")
+    t = sess.token_usage
+    assert t["calls"] == 5 and t["prompt"] == 700 and t["completion"] == 70, f"会话累计错误：{t}"
+    print("PASS token usage tracking（双来源提取 + 轮末汇总 + Session 累计）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -573,6 +615,7 @@ if __name__ == "__main__":
         test_agent_sliding_window()
         test_report_template_saves_llm()
         test_worker_fault_tolerance()
+        test_token_usage_tracking()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

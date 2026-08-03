@@ -27,6 +27,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -177,10 +178,48 @@ def _llm_log_enabled() -> bool:
     return os.environ.get("BLUE_LOG_LLM", "").lower() in ("1", "true", "yes", "on")
 
 
+# ─────────────────────────── token 用量追踪 ───────────────────────────
+# _logged_invoke 统一入口无条件累加（带锁，并行 worker 共用）；每轮需求结束
+# 打印本轮消耗并计入 Session。单次调用明细见 BLUE_LOG_LLM=1 的 LLM 全文日志。
+
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_COLLECTOR = {"prompt": 0, "completion": 0, "calls": 0}
+
+
+def _extract_usage(resp) -> tuple[int, int]:
+    """从模型响应提取 (prompt_tokens, completion_tokens)。
+    优先 LangChain 标准 usage_metadata，fallback OpenAI 原生 response_metadata。"""
+    um = getattr(resp, "usage_metadata", None)
+    if um:
+        return um.get("input_tokens", 0) or 0, um.get("output_tokens", 0) or 0
+    meta = getattr(resp, "response_metadata", None) or {}
+    tu = meta.get("token_usage") or {}
+    return tu.get("prompt_tokens", 0) or 0, tu.get("completion_tokens", 0) or 0
+
+
+def _record_usage(resp) -> None:
+    p, c = _extract_usage(resp)
+    with _TOKEN_LOCK:
+        _TOKEN_COLLECTOR["prompt"] += p
+        _TOKEN_COLLECTOR["completion"] += c
+        _TOKEN_COLLECTOR["calls"] += 1
+
+
+def _reset_token_usage() -> None:
+    with _TOKEN_LOCK:
+        _TOKEN_COLLECTOR.update(prompt=0, completion=0, calls=0)
+
+
+def _token_usage_snapshot() -> dict:
+    with _TOKEN_LOCK:
+        return dict(_TOKEN_COLLECTOR)
+
+
 def _logged_invoke(model: ChatOpenAI, messages: list, caller: str):
-    """model.invoke 的观测包装：BLUE_LOG_LLM=1 时落 LLM 全文日志。"""
+    """model.invoke 的观测包装：累加 token 用量；BLUE_LOG_LLM=1 时落 LLM 全文日志。"""
     t0 = time.monotonic()
     resp = model.invoke(messages)
+    _record_usage(resp)
     if _llm_log_enabled():
         duration = time.monotonic() - t0
         lines = [f"=== {caller} ({duration:.1f}s) ==="]
@@ -747,6 +786,8 @@ class Session:
         self.thread_id = thread_id or f"blue-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         self.round = 0
         self.created_at = datetime.now().isoformat(timespec="seconds")
+        # 会话级 token 累计（内存，不落库；重启清零）
+        self.token_usage = {"prompt": 0, "completion": 0, "calls": 0}
 
     @property
     def config(self) -> dict:
@@ -842,6 +883,9 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         vals = cur.values if cur else {}
         print(f"[蓝] 当前 thread：{sess.thread_id}")
         print(f"     已进行 {sess.round} 轮需求")
+        if sess.token_usage["calls"]:
+            t = sess.token_usage
+            print(f"     token 累计：{t['prompt']} + {t['completion']} = {t['prompt'] + t['completion']}（{t['calls']} 次调用）")
         print(f"     图状态：next={list(cur.next) if cur and cur.next else '（已完成）'}")
         if vals.get("plan"):
             print(f"     最近计划：{json.dumps(vals['plan'], ensure_ascii=False)}")
@@ -1025,10 +1069,26 @@ def _print_node(node_name: str, output: dict) -> None:
         print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BLUE))
 
 
+def _finish_round_usage(sess: Session) -> None:
+    """一轮需求结束：汇总本轮 token 消耗，计入 Session 并播报。"""
+    usage = _token_usage_snapshot()
+    for k in sess.token_usage:
+        sess.token_usage[k] += usage.get(k, 0)
+    if usage["calls"]:
+        total = usage["prompt"] + usage["completion"]
+        sess_total = sess.token_usage["prompt"] + sess.token_usage["completion"]
+        print(_c(
+            f"[蓝] 📊 本轮 token：{usage['prompt']} + {usage['completion']} = {total}"
+            f"（{usage['calls']} 次调用）｜会话累计 {sess_total}",
+            _C.DIM,
+        ))
+
+
 def run_round(graph, sess: Session, request: str) -> None:
     """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
     config = sess.config
     state = initial_state(request)
+    _reset_token_usage()
     print(_c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE))
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
@@ -1070,6 +1130,7 @@ def run_round(graph, sess: Session, request: str) -> None:
                             print(_c(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}", _C.GREEN))
                         else:
                             _emit_step(node_name, output)
+    _finish_round_usage(sess)
     _save_session_meta(sess)
 
 
@@ -1161,6 +1222,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
     """benchmark 模式：单轮执行，guard 自动 approve 不中断。"""
     config = sess.config
     state = initial_state(request)
+    _reset_token_usage()
     print(_c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE))
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
@@ -1181,6 +1243,7 @@ def run_round_auto(graph, sess: Session, request: str) -> None:
                 for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
                         _emit_step(node_name, output)
+    _finish_round_usage(sess)
     _save_session_meta(sess)
 
 

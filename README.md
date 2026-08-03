@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（15 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（16 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -137,7 +137,7 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 15 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 16 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）/ 滑动窗口 / report 模板化
 python validate_graph.py
@@ -206,6 +206,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume`。
 
 交互界面带颜色区分：用户输入提示符 `>`（亮青）、[蓝] 播报（蓝）、[蓝·worker]（青）、放行/成功（绿）、待审批/打回（黄）、验证失败行（红）。仅真实终端启用——管道/重定向（benchmark 子进程）自动无色；设 `NO_COLOR=1` 可强制关闭（遵循 no-color.org 惯例）。`input()` 提示符的 ANSI 码用 `\001\002` 包围（readline 光标安全），并自动启用 readline 行编辑/历史。
+
+每轮需求结束自动播报本轮 token 消耗（prompt + completion + 调用次数）与会话累计；`/history` 可查看会话累计。单次调用明细（usage/耗时/全文）见 `BLUE_LOG_LLM=1` 的 LLM 日志。
 
 会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。
 
