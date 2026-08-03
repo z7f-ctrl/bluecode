@@ -757,7 +757,7 @@ def report(state: AgentState) -> dict:
             HumanMessage(
                 content=(
                     f"用户需求：{state['request']}\n"
-                    f"最终改动清单：{json.dumps(state.get('executed_changes', []), ensure_ascii=False)[:2000]}\n"
+                    f"最终改动清单：\n{_summarize_changes_for_review(state.get('executed_changes', []))}\n"
                     f"评审轮数：{state.get('review_rounds', 0)}\n"
                     f"执行/测试结果：{state.get('feedback', '(无)')}"
                 )
@@ -1075,6 +1075,42 @@ def _shown_change(c: dict) -> dict:
     return shown
 
 
+def _preview_lines(text: str, n: int = 5) -> str:
+    """长文本预览：前 n 行 + 总行数提示（审批场景：看得见概要，不被刷屏）。"""
+    lines = text.split("\n")
+    if len(lines) <= n:
+        return text
+    return "\n".join(lines[:n]) + f"\n  …（共 {len(lines)} 行，按 d 查看全文）"
+
+
+def _print_change_approval(ci: int, ch: dict) -> None:
+    """审批列表的单条改动：给内容预览而非只有长度——审批是安全底线，
+    只看 content_len=N 就按 y 等于闭眼放行。"""
+    action = ch["action"]
+    if action == "plan_run_command":
+        # 命令本来就不长，完整显示
+        print(_c(f"  {ci}. [{action}] {ch.get('command', '')}", _C.YELLOW))
+        return
+    print(_c(f"  {ci}. [{action}] {ch.get('path', '')}", _C.YELLOW))
+    if action == "plan_patch":
+        print(_c(f"     --- old\n{_preview_lines(ch.get('old', ''), 3)}", _C.DIM))
+        print(_c(f"     +++ new\n{_preview_lines(ch.get('new', ''), 3)}", _C.DIM))
+    elif action == "plan_write_file":
+        print(_c(_preview_lines(ch.get("content", "")), _C.DIM))
+    elif action == "plan_run_python":
+        print(_c(_preview_lines(ch.get("code", ""), 10), _C.DIM))
+
+
+def _print_changes_full(changes: list[dict]) -> None:
+    """[d] 详情：完整打印每条改动的全部内容（用户主动要求，不再截断）。"""
+    for ci, ch in enumerate(changes, 1):
+        print(_c(f"── 改动 {ci} [{ch['action']}] {'─' * 30}", _C.YELLOW))
+        for k, v in ch.items():
+            if k != "action":
+                print(f"{k}: {v}")
+        print()
+
+
 def _print_pending(prefix: str, changes: list[dict]) -> None:
     """打印暂存的改动清单（agent 与 worker 共用）。"""
     for c in changes:
@@ -1155,10 +1191,9 @@ def run_round(graph, sess: Session, request: str) -> None:
             if task.interrupts:
                 payload = task.interrupts[0].value
                 print(_c("\n[蓝] ⏸ 等待你审批：", _C.YELLOW))
-                for ci, ch in enumerate(payload.get("changes", []), 1):
-                    # 复用 _shown_change 截断逻辑：500 行 content/长代码只显示长度，
-                    # 审批要看清的是「改哪个文件、跑什么命令」，不是全量内容
-                    print(_c(f"  {ci}. [{ch['action']}] {json.dumps(_shown_change(ch), ensure_ascii=False)}", _C.YELLOW))
+                changes = payload.get("changes", [])
+                for ci, ch in enumerate(changes, 1):
+                    _print_change_approval(ci, ch)
 
                 def ask(prompt: str) -> str:
                     try:
@@ -1167,7 +1202,13 @@ def run_round(graph, sess: Session, request: str) -> None:
                         print(_c("\n[蓝] ⏹ 输入流已关闭，按「拒绝」安全中止。", _C.RED))
                         return "n"
 
-                choice = ask(_prompt("[y]允许 [n]拒绝 [m]修改意见 > ", _C.BRIGHT_CYAN))
+                # [d] 详情：看完全文后回到审批提示，不计为决策
+                while True:
+                    choice = ask(_prompt("[y]允许 [n]拒绝 [m]修改意见 [d]详情 > ", _C.BRIGHT_CYAN))
+                    if choice == "d":
+                        _print_changes_full(changes)
+                        continue
+                    break
                 resume_val = {"action": "approve"}
                 if choice == "n":
                     resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
