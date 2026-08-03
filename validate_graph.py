@@ -598,6 +598,44 @@ def test_token_usage_tracking():
     print("PASS token usage tracking（双来源提取 + 轮末汇总 + Session 累计）✔\n")
 
 
+def test_report_gets_executed_changes():
+    """P1 修复验证：report 的改动清单与 reviewer 的 diff 来自 executed_changes。
+
+    此前 report 传 state['pending_changes']（guard 审批后必为 []），改动清单永远为空；
+    reviewer 也只看执行结果文本看不到 diff。test_report_template 只覆盖只读分支，没抓到这个。"""
+    class RecordingFake:
+        def __init__(self, seq):
+            self.seq = list(seq)
+            self.inputs: list[str] = []
+
+        def invoke(self, messages, *a, **k):
+            self.inputs.append("\n".join(str(m.content) for m in messages))
+            item = self.seq.pop(0) if self.seq else AIMessage(content="done")
+            return item if isinstance(item, AIMessage) else AIMessage(content=item)
+
+    scratch = "__scratch_report_changes__.txt"
+    try:
+        calls = [
+            AIMessage(content='["写文件"]'),                                    # planner
+            AIMessage(content="写", tool_calls=[                               # agent 第 1 次：暂存后 break（只调 1 次）
+                {"name": "plan_write_file", "args": {"path": scratch, "content": "独特标记 CONTENT_MARK_123\n"}, "id": "w1"}]),
+            AIMessage(content="verdict: pass\nfeedback: ok。"),                  # reviewer
+            AIMessage(content="# 报告\n完成。"),                                  # report
+        ]
+        fake = RecordingFake(calls)
+        order, state = run_on(fake, f"写入 {scratch}", resume_action={"action": "approve"})
+        reviewer_input = next((t for t in fake.inputs if "评审轮数" in t), "")
+        report_input = next((t for t in fake.inputs if "最终改动清单" in t), "")
+        assert "CONTENT_MARK_123" in reviewer_input, "reviewer 应看到实际改动内容（diff 可见性）"
+        assert "CONTENT_MARK_123" in report_input, "report 的改动清单不应为空（此前永远 []）"
+        assert state["executed_changes"], "executed_changes 应留存完整改动"
+        assert state["changed_files"] == [scratch], f"changed_files 字段错误：{state['changed_files']}"
+        print("PASS report/reviewer executed_changes（清单非空 + diff 可见 + changed_files 字段）✔\n")
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -616,6 +654,7 @@ if __name__ == "__main__":
         test_report_template_saves_llm()
         test_worker_fault_tolerance()
         test_token_usage_tracking()
+        test_report_gets_executed_changes()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

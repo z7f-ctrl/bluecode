@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（16 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（17 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -80,6 +80,8 @@ class AgentState(TypedDict):
     parallel_tasks: list[str]                 # planner 拆出的可并行子任务（空 = 走串行）
     current_subtask: str                      # Send 注入给单个 worker 的子任务
     worker_notes: list[str]                   # 各并行 worker 的一句话总结（reducer 聚合）
+    executed_changes: list[dict]                # guard 执行通过后留存的完整改动（reviewer 看 diff、report 列清单）
+    changed_files: list[str]                    # guard 写入的改动文件列表（verifier 读）
 ```
 
 ## 工具集（`tools.py`）
@@ -137,7 +139,7 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 16 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 17 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）/ 滑动窗口 / report 模板化
 python validate_graph.py

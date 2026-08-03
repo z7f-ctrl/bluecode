@@ -89,6 +89,8 @@ class AgentState(TypedDict):
     parallel_tasks: list[str]        # planner 产出的可并行子任务（空 = 走串行 agent）
     current_subtask: str             # Send 注入给单个 worker 的子任务描述
     worker_notes: Annotated[list[str], _resettable_add]  # 各 worker 的一句话总结，聚合
+    executed_changes: list[dict]     # guard 执行通过后留存的完整改动（reviewer 看 diff、report 列清单；pending_changes 审批后即清空，不能用）
+    changed_files: list[str]         # guard 写入的改动文件列表（verifier 读，替代【改动文件】文本协议）
 
 
 def initial_state(request: str) -> AgentState:
@@ -104,6 +106,8 @@ def initial_state(request: str) -> AgentState:
         "parallel_tasks": [],
         "current_subtask": "",
         "worker_notes": [],
+        "executed_changes": [],
+        "changed_files": [],
     }
 
 
@@ -236,11 +240,8 @@ def _logged_invoke(model: ChatOpenAI, messages: list, caller: str):
         if getattr(resp, "tool_calls", None):
             lines.append(f"--> tool_calls={json.dumps(resp.tool_calls, ensure_ascii=False)}")
         meta = getattr(resp, "response_metadata", None) or {}
-        usage = meta.get("token_usage") or {}
-        lines.append(
-            f"--> finish={meta.get('finish_reason')} "
-            f"tokens={usage.get('prompt_tokens')}/{usage.get('completion_tokens')}"
-        )
+        p_tok, c_tok = _extract_usage(resp)  # 与收集器同口径（双来源），不写 None/None
+        lines.append(f"--> finish={meta.get('finish_reason')} tokens={p_tok}/{c_tok}")
         _llm_logger().info("\n".join(lines))
     return resp
 
@@ -260,7 +261,8 @@ def should_skip_planner(request: str) -> bool:
 def planner(state: AgentState) -> dict:
     if should_skip_planner(state["request"]):
         return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed",
-                "parallel_tasks": [], "worker_notes": []}
+                "parallel_tasks": [], "worker_notes": [],
+                "executed_changes": [], "changed_files": []}
     resp = _logged_invoke(
         _make_plain_model(),
         [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])],
@@ -289,7 +291,8 @@ def planner(state: AgentState) -> dict:
     if not isinstance(plan, list) or not all(isinstance(p, str) for p in plan):
         plan = [state["request"]]
     return {"plan": plan, "current_step": 0, "verdict": "proceed",
-            "parallel_tasks": parallel, "worker_notes": []}
+            "parallel_tasks": parallel, "worker_notes": [],
+            "executed_changes": [], "changed_files": []}
 
 
 def agent(state: AgentState) -> dict:
@@ -373,8 +376,11 @@ def agent(state: AgentState) -> dict:
                 for tm in tool_messages:
                     messages.append(tm)
                     updated.append(tm)
-        step = min(step + 1, max(len(state.get("plan", [])) or 1, 1))
+        # 计划步只在一批改动攒出（即将进入审批）时推进：
+        # 此前每次工具迭代都自增，step 语义实际是「迭代计数」，
+        # 与 tip 里「当前第 N/M 步」的计划步含义不符
         if pending:
+            step = min(step + 1, max(len(state.get("plan", [])) or 1, 1))
             break
     else:
         # 达到工具迭代上限，强制结束并提示
@@ -460,21 +466,27 @@ def worker(state: AgentState) -> dict:
 def guard(state: AgentState) -> dict:
     if not state.get("pending_changes"):
         notes = "；".join(state.get("worker_notes", []))
-        return {"verdict": "proceed", "pending_changes": [], "feedback": notes}
+        return {"verdict": "proceed", "pending_changes": [], "feedback": notes,
+                "executed_changes": [], "changed_files": []}
     answer = interrupt({"changes": state["pending_changes"], "question": "以上改动/命令是否允许执行？"})
     action = answer.get("action") if isinstance(answer, dict) else "approve"
     if action == "reject":
-        return {"verdict": "rejected", "pending_changes": [], "feedback": answer.get("note", "用户拒绝")}
+        return {"verdict": "rejected", "pending_changes": [], "feedback": answer.get("note", "用户拒绝"),
+                "executed_changes": [], "changed_files": []}
     if action == "modify":
-        return {"verdict": "revise", "pending_changes": [], "feedback": answer.get("note", "用户要求修改")}
-    # 记录改动文件列表，供 verifier 做语法检查
-    changed_files = [c.get("path", "") for c in state["pending_changes"] if c.get("path")]
-    summary = "\n".join(execute_change(c) for c in state["pending_changes"])
+        return {"verdict": "revise", "pending_changes": [], "feedback": answer.get("note", "用户要求修改"),
+                "executed_changes": [], "changed_files": []}
+    # 执行前留存完整改动清单：reviewer 看 diff、report 列清单、verifier 读 changed_files。
+    # pending_changes 随后清空，不存一份的话下游全拿不到改了什么（P1 实测坑）。
+    executed = list(state["pending_changes"])
+    changed_files = [c.get("path", "") for c in executed if c.get("path")]
+    summary = "\n".join(execute_change(c) for c in executed)
     if changed_files:
         summary += f"\n\n【改动文件】{'; '.join(changed_files)}"
     if state.get("worker_notes"):
         summary += "\n\n【并行子任务】\n" + "\n".join(state["worker_notes"])
-    return {"verdict": "approved", "pending_changes": [], "feedback": summary}
+    return {"verdict": "approved", "pending_changes": [], "feedback": summary,
+            "executed_changes": executed, "changed_files": changed_files}
 
 
 def _compress_messages(messages: list, request: str) -> str:
@@ -579,9 +591,10 @@ def verifier(state: AgentState) -> dict:
     feedback = state.get("feedback", "")
     results: list[str] = []
 
-    # 从 feedback 解析改动文件列表（guard 执行后写入）
-    changed_files: list[str] = []
-    if "【改动文件】" in feedback:
+    # 改动文件列表：优先读 guard 写入的 state 字段（v0.5.x 起）；
+    # fallback 解析 feedback 文本协议（兼容旧 checkpoint 恢复的场景）
+    changed_files: list[str] = list(state.get("changed_files", []))
+    if not changed_files and "【改动文件】" in feedback:
         files_part = feedback.split("【改动文件】")[-1].strip()
         changed_files = [f.strip() for f in files_part.split(";") if f.strip()]
 
@@ -619,7 +632,7 @@ def verifier(state: AgentState) -> dict:
         for tf in test_files[:3]:
             try:
                 r = subprocess.run(
-                    ["python3", "-m", "pytest", tf, "-v", "--tb=short"],
+                    [sys.executable, "-m", "pytest", tf, "-v", "--tb=short"],
                     capture_output=True, text=True, timeout=30, cwd=_resolve(".")
                 )
                 if r.returncode == 0:
@@ -645,6 +658,36 @@ def verifier(state: AgentState) -> dict:
     return {"feedback": feedback}
 
 
+def _summarize_changes_for_review(changes: list[dict]) -> str:
+    """给 reviewer 看的实际改动内容（diff 摘要，总上限 2000 字符）。
+
+    此前 reviewer 只能看 feedback 里的执行结果文本——「测试通过但语义错误」
+    的改动拦不住（无测试覆盖的真机场景只剩 py_compile 兜底）。
+    """
+    if not changes:
+        return "（无）"
+    parts: list[str] = []
+    budget = 2000
+    for c in changes:
+        head = f"[{c.get('action', '?')}] {c.get('path') or c.get('command') or ''}"
+        detail = ""
+        if "old" in c or "new" in c:
+            detail = f"\n  - old: {str(c.get('old', ''))[:300]}\n  + new: {str(c.get('new', ''))[:300]}"
+        elif "content" in c:
+            text = c["content"]
+            detail = f"\n  content: {text[:300]}{'…' if len(text) > 300 else ''}"
+        elif "code" in c:
+            code = c["code"]
+            detail = f"\n  code: {code[:300]}{'…' if len(code) > 300 else ''}"
+        part = head + detail
+        if budget - len(part) < 0:
+            parts.append("…（其余改动截断）")
+            break
+        parts.append(part)
+        budget -= len(part)
+    return "\n".join(parts)
+
+
 def reviewer(state: AgentState) -> dict:
     rounds = state.get("review_rounds", 0)
     verdict = state.get("verdict", "proceed")
@@ -661,7 +704,8 @@ def reviewer(state: AgentState) -> dict:
                 content=(
                     f"用户需求：{state['request']}\n"
                     f"评审轮数（当前第 {rounds} 轮，上限 {MAX_REVIEW_ROUNDS}）\n"
-                    f"本次执行结果：\n{state.get('feedback', '(无)')}"
+                    f"本次执行结果：\n{state.get('feedback', '(无)')}\n"
+                    f"实际改动内容：\n{_summarize_changes_for_review(state.get('executed_changes', []))}"
                 )
             ),
         ],
@@ -713,7 +757,7 @@ def report(state: AgentState) -> dict:
             HumanMessage(
                 content=(
                     f"用户需求：{state['request']}\n"
-                    f"最终改动清单：{json.dumps(state.get('pending_changes', []), ensure_ascii=False)}\n"
+                    f"最终改动清单：{json.dumps(state.get('executed_changes', []), ensure_ascii=False)[:2000]}\n"
                     f"评审轮数：{state.get('review_rounds', 0)}\n"
                     f"执行/测试结果：{state.get('feedback', '(无)')}"
                 )
@@ -1021,15 +1065,20 @@ def _prompt(text: str, color: str) -> str:
     return f"{_P1}{color}{_P2}{text}{_P1}{_C.RESET}{_P2}" if _USE_COLOR else text
 
 
+def _shown_change(c: dict) -> dict:
+    """改动摘要：大字段（content/old/new/code）替换为长度，防长内容刷爆终端。
+    _print_pending 播报与 run_round 审批展示共用。"""
+    shown = {k: v for k, v in c.items() if k != "action"}
+    for big in ("content", "old", "new", "code"):
+        if big in shown:
+            shown[f"{big}_len"] = len(shown.pop(big))
+    return shown
+
+
 def _print_pending(prefix: str, changes: list[dict]) -> None:
     """打印暂存的改动清单（agent 与 worker 共用）。"""
     for c in changes:
-        shown = {k: v for k, v in c.items() if k != "action"}
-        # 大字段只显示长度，不打印完整内容
-        for big in ("content", "old", "new"):
-            if big in shown:
-                shown[f"{big}_len"] = len(shown.pop(big))
-        print(f"{prefix} 已暂存待审批 → {c['action']}({json.dumps(shown, ensure_ascii=False)})")
+        print(f"{prefix} 已暂存待审批 → {c['action']}({json.dumps(_shown_change(c), ensure_ascii=False)})")
 
 
 def _print_node(node_name: str, output: dict) -> None:
@@ -1107,8 +1156,9 @@ def run_round(graph, sess: Session, request: str) -> None:
                 payload = task.interrupts[0].value
                 print(_c("\n[蓝] ⏸ 等待你审批：", _C.YELLOW))
                 for ci, ch in enumerate(payload.get("changes", []), 1):
-                    shown = {k: v for k, v in ch.items() if k != "action"}
-                    print(_c(f"  {ci}. [{ch['action']}] {json.dumps(shown, ensure_ascii=False)}", _C.YELLOW))
+                    # 复用 _shown_change 截断逻辑：500 行 content/长代码只显示长度，
+                    # 审批要看清的是「改哪个文件、跑什么命令」，不是全量内容
+                    print(_c(f"  {ci}. [{ch['action']}] {json.dumps(_shown_change(ch), ensure_ascii=False)}", _C.YELLOW))
 
                 def ask(prompt: str) -> str:
                     try:
@@ -1211,6 +1261,8 @@ def main() -> None:
         # 用户取消或无效 → 落入新会话
     if args.auto_approve:
         # benchmark 模式：非交互，单轮，guard 自动通过
+        if not (args.request or "").strip():
+            parser.error("--auto-approve 需要同时提供需求（request），空需求没有可执行内容")
         register_step_callback(_print_node)
         sess = Session()
         run_round_auto(graph, sess, args.request or "")
