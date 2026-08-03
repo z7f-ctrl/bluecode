@@ -30,7 +30,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（17 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（20 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -139,9 +139,10 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 17 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 20 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
-# 安全加固（命令复合符 / subprocess / getattr dunder）/ 工具易用性（grep 截断 + patch occurrence）/ 滑动窗口 / report 模板化
+# 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
+# executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -174,7 +175,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.4.5 | reviewer 判定 fail-closed + 判分管线修复 + benchmark 扩至 40 题（+9 图算法）+ runner 并行 | ✅ 已实现 |
 | v0.5 | 多文件并行修改：`Send` 扇出 worker + reducer 聚合 + 一次性审批 | ✅ 已实现 |
 | v0.5.x | 日志两层 + token 追踪 + 滑动窗口 + 安全加固 + CLI 颜色 + executed_changes + 审批预览/详情 + 工具易用性 | ✅ 已实现 |
-| v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | 未实现 |
+| v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、权限分级 `.blue.toml`（allow/ask/deny）、`/retry` 失败恢复 | 未实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
@@ -208,7 +209,13 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 > /quit          # 退出
 ```
 
-可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume`。
+可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo`。
+
+`/undo` 回退最近一次审批通过的文件改动：guard 执行前自动把 `changed_files` 快照到 `~/.blue/backups/<thread>/<ts>/`（已存在文件备份内容、新建文件记录路径），undo 时写回+删除。**边界：仅 `plan_write_file`/`plan_patch` 可撤；`plan_run_command`/`plan_run_python` 的副作用（装包、删文件、系统状态）不在快照内，不可撤。**单轮指针（只撤最近一轮），快照目录保留在磁盘可手动翻。
+
+审批环节按键：`y` 全批 / `n` 全拒 / `m` 修改意见 / `d` 详情（patch 渲染红绿 unified diff、写文件/代码按扩展名语法高亮、超 100 行分页；依赖 `rich`，缺失时降级纯文本）/ `1,3` 序号选批（只批这几条，跳过的记入 feedback 供 reviewer 参考）。每次审批决定（含拒绝/修改/auto-approve）追加写 `~/.blue/audit.jsonl` 审计日志。
+
+`--auto-approve` 模式按结果退出：`verdict != "pass"` 或 verifier 报 ✗ → exit 1（CI 可用）；`.env` 配置 `PRICE_PER_1M_INPUT/OUTPUT` 后轮末播报显示本轮成本。
 
 交互界面带颜色区分：用户输入提示符 `>`（亮青）、[蓝] 播报（蓝）、[蓝·worker]（青）、放行/成功（绿）、待审批/打回（黄）、验证失败行（红）。仅真实终端启用——管道/重定向（benchmark 子进程）自动无色；设 `NO_COLOR=1` 可强制关闭（遵循 no-color.org 惯例）。`input()` 提示符的 ANSI 码用 `\001\002` 包围（readline 光标安全），并自动启用 readline 行编辑/历史。
 
