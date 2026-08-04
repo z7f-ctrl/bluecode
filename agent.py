@@ -1155,7 +1155,7 @@ class _C:
     GREEN = "\033[32m" if _USE_COLOR else ""       # 放行 / 成功
     YELLOW = "\033[33m" if _USE_COLOR else ""      # 待审批 / 打回（需要用户注意）
     RED = "\033[31m" if _USE_COLOR else ""         # 错误
-    BRIGHT_CYAN = "\033[96m" if _USE_COLOR else ""  # 用户输入提示符
+    BRIGHT_CYAN = "\033[96m" if _USE_COLOR else ""  # 用户输入提示符 / 交付报告
     DIM = "\033[2m" if _USE_COLOR else ""          # 自动模式播报
     RESET = "\033[0m" if _USE_COLOR else ""
 
@@ -1326,7 +1326,7 @@ def _print_node(node_name: str, output: dict) -> None:
         mark = "✅ 放行" if passed else "🔪 打回"
         print(_c(f"[评审] {mark}｜{output.get('feedback', '')}", _C.GREEN if passed else _C.YELLOW))
     elif node_name == "report":
-        print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BLUE))
+        print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BRIGHT_CYAN))
 
 
 def _round_cost_str(usage: dict) -> str:
