@@ -31,6 +31,8 @@ class FakeModel:
     def invoke(self, messages, *a, **k):
         item = self.seq.pop(0) if self.seq else "（耗尽）fallback"
         self.calls += 1
+        if isinstance(item, Exception):
+            raise item  # 脚本化异常：测自动重试与 /retry 断点续跑
         if isinstance(item, AIMessage):
             return item
         return AIMessage(content=item)
@@ -756,6 +758,191 @@ def test_undo_snapshot_restore():
                 os.remove(f)
 
 
+def test_llm_auto_retry():
+    """_logged_invoke 自动重试：瞬时错误退避重试 2 次后成功；非瞬时错误直接抛。"""
+    class RateLimitError(Exception):  # 类型名命中 _TRANSIENT_EXC_NAMES 兜底匹配
+        pass
+
+    flaky = FakeModel([RateLimitError("限流"), RateLimitError("再限"), "最终成功"])
+    with patch("agent.time.sleep", lambda s: None), \
+         patch("agent.random.uniform", lambda a, b: 0.0):  # 不等真退避
+        resp = agent._logged_invoke(flaky, [], "test")
+    assert resp.content == "最终成功", f"重试后应成功，实际 {resp.content!r}"
+    assert flaky.calls == 3, f"应调用 3 次（2 败 1 成），实际 {flaky.calls}"
+
+    hard = FakeModel([ValueError("bad request")])  # 非瞬时：不重试直接抛
+    with patch("agent.time.sleep", lambda s: None):
+        try:
+            agent._logged_invoke(hard, [], "test")
+            raise AssertionError("非瞬时错误应直接抛出")
+        except ValueError:
+            pass
+    assert hard.calls == 1, f"非瞬时错误不应重试，实际调用 {hard.calls} 次"
+    print("PASS llm auto retry（瞬时重试 2 次成功 + 非瞬时直接抛）✔\n")
+
+
+def test_resume_pending_after_crash():
+    """/retry 断点续跑：planner 崩溃 → run_round 中断不写文件 → resume_pending 续跑完成；
+    已正常结束的轮 resume_pending 空操作返回 False。"""
+    scratch = "__scratch_retry__.txt"
+    calls = [
+        RuntimeError("boom"),                      # planner 首调即崩（非瞬时，不重试直接抛）
+        AIMessage(content='["写 scratch"]'),        # 续跑后 planner 重跑
+        AIMessage(content="写", tool_calls=[
+            {"name": "plan_write_file", "args": {"path": scratch, "content": "断点续跑内容\n"}, "id": "w1"}]),
+        # agent 暂存写改动后立即 break 进审批，无收尾调用；下一个是 reviewer
+        AIMessage(content="verdict: pass\nfeedback: ok。"),
+        AIMessage(content="# 报告\n完成。"),
+    ]
+    fake = FakeModel(calls)
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="retry-test")
+    try:
+        with patch("agent._make_model", lambda: fake), \
+             patch("agent._make_plain_model", lambda: fake), \
+             patch("agent.should_skip_planner", lambda r: False), \
+             patch("builtins.input", lambda *a, **k: "y"):
+            agent.run_round(graph, sess, f"写入 {scratch}")  # planner 崩溃，本轮中断
+            assert not os.path.exists(scratch), "崩溃中断不应写文件"
+            cur = graph.get_state(sess.config)
+            assert cur.next, "崩溃后 checkpoint 应有待执行节点"
+            assert agent.resume_pending(graph, sess) is True, "有断点应续跑"
+        with open(scratch, encoding="utf-8") as f:
+            assert f.read() == "断点续跑内容\n", "续跑后应完成写入"
+        assert agent.resume_pending(graph, sess) is False, "已正常结束应空操作（绝不默默重跑）"
+        print("PASS /retry resume（崩溃续跑完成 + 已结束空操作）✔\n")
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
+
+
+def test_permission_allow_skips_interrupt():
+    """.blue.toml write=allow：纯写批次跳过 interrupt 直接执行 + 审计记 auto_allow；
+    混合批次（write=allow + command=ask）仍走人工审批。"""
+    import tools
+    scratch = "__scratch_allow__.txt"
+    cmd_scratch = "__scratch_allow_cmd__.txt"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = os.path.join(td, "config.toml")
+        audit_path = os.path.join(td, "audit.jsonl")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write('[permissions]\nwrite = "allow"\n')
+        interrupt_calls = []
+        real_interrupt = agent.interrupt
+        def spy_interrupt(payload):
+            interrupt_calls.append(payload)
+            return real_interrupt(payload)
+        # run_on 内部已 patch 双模型 + should_skip_planner，这里只补配置/审计/intercept 间谍
+        def cfg_patches():
+            return (
+                patch("tools.GLOBAL_CONFIG_PATH", cfg),
+                patch("tools.PROJECT_CONFIG_NAME", ".blue-test-nonexistent.toml"),
+                patch("agent.AUDIT_LOG", audit_path),
+                patch("agent.interrupt", spy_interrupt),
+            )
+        try:
+            # ① 纯写批次：不 interrupt，直接执行 + 审计 auto_allow
+            # 注意：agent 暂存写改动后立即 break 进审批（agent.py 的 pending break），
+            # 不会再调一次模型要收尾文本——序列里没有 agent 收尾项
+            calls = [
+                AIMessage(content='["写"]'),
+                AIMessage(content="写", tool_calls=[
+                    {"name": "plan_write_file", "args": {"path": scratch, "content": "放行内容\n"}, "id": "w1"}]),
+                AIMessage(content="verdict: pass\nfeedback: ok。"),
+                AIMessage(content="# 报告\n完成。"),
+            ]
+            p = cfg_patches()
+            with p[0], p[1], p[2], p[3]:
+                order, state = run_on(FakeModel(calls), f"写入 {scratch}", thread_id="allow-test")
+            assert not interrupt_calls, "纯 allow 批次不应触发 interrupt"
+            assert state["verdict"] == "pass", f"应一轮通过：{state['verdict']}"
+            with open(scratch, encoding="utf-8") as f:
+                assert f.read() == "放行内容\n", "配置放行应直接执行"
+            with open(audit_path, encoding="utf-8") as f:
+                recs = [json.loads(line) for line in f]
+            assert len(recs) == 1 and recs[0]["action"] == "auto_allow", f"审计应记 auto_allow：{recs}"
+
+            # ② 混合批次：command=ask（缺省）→ 仍 interrupt
+            interrupt_calls.clear()
+            calls2 = [
+                AIMessage(content='["写+跑"]'),
+                AIMessage(content="写跑", tool_calls=[
+                    {"name": "plan_write_file", "args": {"path": cmd_scratch, "content": "x\n"}, "id": "w1"},
+                    {"name": "plan_run_command", "args": {"command": "echo mixed"}, "id": "c1"}]),
+                AIMessage(content="verdict: pass\nfeedback: ok。"),
+                AIMessage(content="# 报告\n完成。"),
+            ]
+            p = cfg_patches()
+            with p[0], p[1], p[2], p[3]:
+                run_on(FakeModel(calls2), "写文件再跑命令", thread_id="allow-mixed")
+            # interrupt() 被调 2 次 = 1 次人工审批：resume 时 guard 节点整体重跑，
+            # 第一次调用抛出中断、第二次（重跑后）返回 resume 值
+            assert len(interrupt_calls) == 2, f"混合批次（含 ask 类别）应整批走人工审批：{len(interrupt_calls)}"
+            print("PASS permission allow（纯写直批 + auto_allow 审计 + 混合批次仍审批）✔\n")
+        finally:
+            for f in (scratch, cmd_scratch):
+                if os.path.exists(f):
+                    os.remove(f)
+
+
+def test_permission_deny_and_fallback():
+    """.blue.toml command=deny：暂存即拒（反馈模型）+ execute_change 最后防线；
+    配置缺失/非法回落 ask（fail-closed）；只读工具恒 allow。"""
+    import tools
+    with tempfile.TemporaryDirectory() as td:
+        cfg = os.path.join(td, "config.toml")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write('[permissions]\ncommand = "deny"\n')
+        with patch("tools.GLOBAL_CONFIG_PATH", cfg), \
+             patch("tools.PROJECT_CONFIG_NAME", ".blue-test-nonexistent.toml"):
+            # execute_change 最后防线
+            out = tools.execute_change({"action": "plan_run_command", "command": "echo hi"})
+            assert "执行失败" in out and "deny" in out, f"deny 应拦执行：{out}"
+            assert tools.permission_for_action("grep") == "allow", "只读工具恒 allow"
+            assert tools.permission_for_action("plan_write_file") == "ask", "未配的类别回落 ask"
+            # 暂存即拒：agent 收到「被拦截」反馈，不产生 pending_changes
+            # deny 拦截后 pending 为空 → 不 break，agent 继续调模型直到无 tool_calls 收尾；
+            # 之后 guard proceed → reviewer 短路 pass → report 模板，均不消耗模型调用
+            calls = [
+                AIMessage(content='["跑命令"]'),
+                AIMessage(content="跑", tool_calls=[
+                    {"name": "plan_run_command", "args": {"command": "echo staged"}, "id": "c1"}]),
+                AIMessage(content="被配置禁止，最终答复：无法执行。"),
+            ]
+            fake = RecordingFake(calls)
+            with patch("agent._make_model", lambda: fake), \
+                 patch("agent._make_plain_model", lambda: fake), \
+                 patch("agent.should_skip_planner", lambda r: False):
+                order, state = run_on(fake, "跑个命令", thread_id="deny-test")
+            assert state["pending_changes"] == [], "deny 暂存即拒，不应有 pending"
+            agent_round2 = next((t for t in fake.inputs if "被拦截" in t), "")
+            assert "被 .blue.toml 配置禁止" in agent_round2, f"模型应收到 deny 反馈：{agent_round2[-200:]}"
+        # 非法配置回落 ask
+        bad = os.path.join(td, "bad.toml")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("[permissions]\nwrite = \"sometimes\"\n")
+        with patch("tools.GLOBAL_CONFIG_PATH", bad), \
+             patch("tools.PROJECT_CONFIG_NAME", ".blue-test-nonexistent.toml"):
+            assert tools.load_permissions() == {"write": "ask", "command": "ask", "python": "ask"}, \
+                "非法值应回落 ask（fail-closed）"
+    print("PASS permission deny（暂存拒 + 执行防线 + 非法回落 ask + 只读恒 allow）✔\n")
+
+
+def test_execution_order_files_first():
+    """guard 固定执行顺序：幂等的写文件类在前，命令/Python 在后，同组内保持稳定。"""
+    mixed = [
+        {"action": "plan_run_command", "command": "make"},
+        {"action": "plan_write_file", "path": "a"},
+        {"action": "plan_run_python", "code": "x=1"},
+        {"action": "plan_patch", "path": "b"},
+    ]
+    ordered = agent._execution_order(mixed)
+    assert [c["action"] for c in ordered] == [
+        "plan_write_file", "plan_patch", "plan_run_command", "plan_run_python"], \
+        f"写文件类应先执行：{[c['action'] for c in ordered]}"
+    print("PASS execution order（写文件在前 + 组内稳定）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -778,6 +965,11 @@ if __name__ == "__main__":
         test_audit_log()
         test_selective_approval()
         test_undo_snapshot_restore()
+        test_llm_auto_retry()
+        test_resume_pending_after_crash()
+        test_permission_allow_skips_interrupt()
+        test_permission_deny_and_fallback()
+        test_execution_order_files_first()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
