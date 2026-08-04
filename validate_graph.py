@@ -943,6 +943,48 @@ def test_execution_order_files_first():
     print("PASS execution order（写文件在前 + 组内稳定）✔\n")
 
 
+def test_cross_round_context():
+    """多轮连贯：每轮需求注入 messages → 后续轮 planner/agent 能看到历史需求；
+    历史超 HISTORY_MAX_CHARS 时 planner 入口压成【历史会话摘要】（含历史需求文本）。"""
+    req1 = "统计 hello.py 的行数"
+    def round_calls(tag):
+        return [
+            AIMessage(content='["查一下"]'),
+            AIMessage(content="grep 查", tool_calls=[
+                {"name": "grep", "args": {"pattern": "hello"}, "id": f"g{tag}"}]),
+            AIMessage(content=f"第{tag}轮答复：完成。"),
+            AIMessage(content="verdict: pass\nfeedback: 只读。"),
+            AIMessage(content="# 报告\n完成。"),
+        ]
+    fake = RecordingFake(round_calls("一") + round_calls("二") + round_calls("三"))
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="xround-test")
+    with patch("agent._make_model", lambda: fake), \
+         patch("agent._make_plain_model", lambda: fake), \
+         patch("agent.should_skip_planner", lambda r: False):
+        agent.run_round(graph, sess, req1)
+        agent.run_round(graph, sess, "它有多少个函数")
+        # 只读轮每轮消耗 3 次模型调用（planner、agent×2；reviewer 短路 pass、
+        # report 模板化均不调模型）：第二轮 planner = inputs[3]
+        planner2 = fake.inputs[3]
+        assert req1 in planner2, f"第二轮 planner 应带历史需求：{planner2[:200]}"
+        assert "【历史对话】" in planner2, "有历史时 planner prompt 应有历史段"
+        # 第二轮 agent（inputs[4]）：state messages 里应含第一轮需求
+        assert req1 in fake.inputs[4], "第二轮 agent 应看到第一轮需求"
+        # 第三轮：阈值调到 10，强制跨轮压缩
+        with patch("agent.HISTORY_MAX_CHARS", 10):
+            agent.run_round(graph, sess, "再数一遍")
+        planner3 = fake.inputs[6]
+        assert "【历史会话摘要】" in planner3, f"超阈值应压缩历史：{planner3[:200]}"
+        assert req1 in planner3, "摘要应保留历史需求文本（指代连贯性）"
+        final = graph.get_state(sess.config).values
+        contents = [str(m.content) for m in final["messages"]]
+        assert any("【历史会话摘要】" in c for c in contents), f"state 中应有压缩摘要：{contents}"
+        assert not any("第一轮答复" in c for c in contents), \
+            f"第一轮的旧消息应被 RemoveMessage 清除：{contents}"
+    print("PASS cross-round context（历史需求可见 + 超阈值压缩摘要 + 摘要保留需求）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -970,6 +1012,7 @@ if __name__ == "__main__":
         test_permission_allow_skips_interrupt()
         test_permission_deny_and_fallback()
         test_execution_order_files_first()
+        test_cross_round_context()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

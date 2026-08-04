@@ -314,14 +314,38 @@ def should_skip_planner(request: str) -> bool:
     return True
 
 
+HISTORY_MAX_CHARS = 6000  # 跨轮历史（当前需求之前）总字符超此值时压缩成一条摘要
+
+
 def planner(state: AgentState) -> dict:
+    update: dict = {}
+    history = list(state.get("messages", []))
+    # 跨轮历史压缩（revise 压缩管单轮内，这里管跨轮）：多轮会话下历史无限累积，
+    # planner/agent 每次 invoke 都带全量，token 线性膨胀。规则压缩，不调 LLM；
+    # 保留末尾的当前需求消息不动，只压它之前的。
+    if len(history) > 1 and sum(
+        len(str(getattr(m, "content", ""))) for m in history[:-1]
+    ) > HISTORY_MAX_CHARS:
+        old = history[:-1]
+        removals = [RemoveMessage(id=m.id) for m in old if getattr(m, "id", None)]
+        summary = HumanMessage(
+            content=f"【历史会话摘要】\n{_compress_messages(old, state['request'])}")
+        update["messages"] = removals + [summary]
+        history = [summary] + history[-1:]
+    # 有历史时 planner 带上历史段（指代连贯性："它/那个文件"靠这个解析）；
+    # 无历史（单轮/新会话）prompt 与之前完全一致
+    request_text = state["request"]
+    if history[:-1]:
+        hist_text = "\n".join(
+            f"- {str(getattr(m, 'content', ''))[:200]}" for m in history[:-1])
+        request_text = f"【历史对话】\n{hist_text}\n\n【当前需求】\n{state['request']}"
     if should_skip_planner(state["request"]):
-        return {"plan": [state["request"]], "current_step": 0, "verdict": "proceed",
+        return {**update, "plan": [state["request"]], "current_step": 0, "verdict": "proceed",
                 "parallel_tasks": [], "worker_notes": [],
                 "executed_changes": [], "changed_files": []}
     resp = _logged_invoke(
         _make_plain_model(),
-        [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=state["request"])],
+        [SystemMessage(content=PLANNER_PROMPT), HumanMessage(content=request_text)],
         "planner",
     )
     content = resp.content
@@ -346,7 +370,7 @@ def planner(state: AgentState) -> dict:
         plan = None
     if not isinstance(plan, list) or not all(isinstance(p, str) for p in plan):
         plan = [state["request"]]
-    return {"plan": plan, "current_step": 0, "verdict": "proceed",
+    return {**update, "plan": plan, "current_step": 0, "verdict": "proceed",
             "parallel_tasks": parallel, "worker_notes": [],
             "executed_changes": [], "changed_files": []}
 
@@ -375,10 +399,19 @@ def agent(state: AgentState) -> dict:
     tip = f"计划：{json.dumps(state['plan'], ensure_ascii=False)}；当前第 {state['current_step'] + 1}/{len(state['plan'])} 步。"
     if state.get("verdict") in ("revise", "rejected") and state.get("feedback"):
         tip += f"\n上一轮评审/意见：{state['feedback']}"
+    # 当前需求并进 tip——除非 state messages 末尾已是它（run_round 注入的本轮
+    # HumanMessage(request)），避免重复；revise 回环时 messages 被压成摘要，
+    # 需求只在 tip 里，必须带上
+    history = state["messages"]
+    tail_is_request = bool(history) and isinstance(history[-1], HumanMessage) \
+        and history[-1].content == state["request"]
+    if not tail_is_request:
+        tip = f"当前需求：{state['request']}\n{tip}"
 
-    messages: list = [SystemMessage(content=AGENT_PROMPT), HumanMessage(content=state["request"])]
-    # revise 回环时 state["messages"] 已被 reviewer 压缩成单条摘要，直接复用
-    messages.extend(state["messages"])
+    # 多轮连贯：state messages 含历史各轮的 Human(需求)+AI/工具交互（跨轮压缩
+    # 在 planner 入口做），revise 回环时为 reviewer 压的单条摘要，均直接复用
+    messages: list = [SystemMessage(content=AGENT_PROMPT)]
+    messages.extend(history)
     messages.append(HumanMessage(content=tip))
     head_len = len(messages)  # 头部固定不动；循环内滑动窗口只压缩之后的工具交互
 
@@ -602,9 +635,14 @@ def _compress_messages(messages: list, request: str) -> str:
     read_files: list[str] = []
     planned_changes: list[str] = []
     executed_results: list[str] = []
+    user_turns: list[str] = []  # 历史 HumanMessage（各轮需求原文）
 
     for msg in messages:
-        if isinstance(msg, ToolMessage):
+        if isinstance(msg, HumanMessage):
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if not text.startswith("【"):  # 跳过摘要/tip 类合成消息
+                user_turns.append(text[:100])
+        elif isinstance(msg, ToolMessage):
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             # 提取 read_file 结果
             if "共" in content and "行" in content and "显示" in content:
@@ -630,6 +668,11 @@ def _compress_messages(messages: list, request: str) -> str:
                         read_files.append(f"list_files(dir={args.get('dir', '.')})")
 
     parts = [f"需求：{request}"]
+    if user_turns:
+        # 历史轮次的用户需求（指代连贯性的关键："它/那个文件"指向的对象在这里）
+        prior = [t for t in user_turns if t != request]
+        if prior:
+            parts.append(f"历史需求：{'；'.join(prior[-5:])}")
     if read_files:
         parts.append(f"读取了 {len(read_files)} 个文件：{'; '.join(read_files[:5])}{'…' if len(read_files) > 5 else ''}")
     if planned_changes:
@@ -1559,6 +1602,9 @@ def run_round(graph, sess: Session, request: str) -> None:
     config = sess.config
     state = initial_state(request)
     state["thread_id"] = sess.thread_id
+    # 本轮需求写入 messages（add_messages 追加到历史尾部）——多轮连贯的基础：
+    # 此前 request 从不进 messages，新一轮看不到上一轮问过什么，指代全断
+    state["messages"] = [HumanMessage(content=request)]
     _reset_token_usage()
     print(_c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE))
     try:
@@ -1666,6 +1712,9 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
     config = sess.config
     state = initial_state(request)
     state["thread_id"] = sess.thread_id
+    # 本轮需求写入 messages（add_messages 追加到历史尾部）——多轮连贯的基础：
+    # 此前 request 从不进 messages，新一轮看不到上一轮问过什么，指代全断
+    state["messages"] = [HumanMessage(content=request)]
     _reset_token_usage()
     print(_c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE))
     try:
