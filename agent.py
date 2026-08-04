@@ -15,6 +15,10 @@ v0.2 新增：
 - 斜杠命令（/help /quit /clear /history /graph 等）
 - --resume 恢复历史会话
 
+v0.7 阶段一新增：
+- /retry 断点续跑（run_round 的审批循环抽为 _drain 公共函数，续跑共用）
+- _logged_invoke 对瞬时错误（429/5xx/超时/连接错误）指数退避自动重试
+
 CLI 交互在 __main__ 分支。
 """
 
@@ -24,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -222,10 +227,55 @@ def _token_usage_snapshot() -> dict:
         return dict(_TOKEN_COLLECTOR)
 
 
+# ─────────────────────────── 瞬时错误自动重试（v0.7） ───────────────────────────
+# HTTP 429 / 5xx / 超时 / 连接错误按指数退避自动重试（2s → 8s → 20s + 随机抖动），
+# 重试耗尽才把异常抛给上层（/retry 手工兜底）；非瞬时错误（401/400 等）直接抛。
+
+_RETRY_DELAYS = (2, 8, 20)  # 最多 3 次重试的基准间隔（秒）
+# openai SDK 异常类型名兜底（防御性：拿不到 status_code 时按类型名匹配）
+_TRANSIENT_EXC_NAMES = {
+    "RateLimitError", "APITimeoutError", "APIConnectionError", "InternalServerError",
+}
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """判断是否瞬时错误（值得自动重试）。优先 status_code，拿不到时按异常类型名匹配。"""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        try:
+            code = int(status)
+            return code == 429 or code >= 500 or code in (408, 409)
+        except (TypeError, ValueError):
+            pass
+    if type(exc).__name__ in _TRANSIENT_EXC_NAMES:
+        return True
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
 def _logged_invoke(model: ChatOpenAI, messages: list, caller: str):
-    """model.invoke 的观测包装：累加 token 用量；BLUE_LOG_LLM=1 时落 LLM 全文日志。"""
-    t0 = time.monotonic()
-    resp = model.invoke(messages)
+    """model.invoke 的观测包装：瞬时错误自动重试；累加 token 用量；
+    BLUE_LOG_LLM=1 时落 LLM 全文日志（失败尝试也记日志，usage 只累加成功的）。"""
+    attempt = 0
+    while True:
+        t0 = time.monotonic()
+        try:
+            resp = model.invoke(messages)
+            break
+        except Exception as exc:
+            if _llm_log_enabled():
+                _llm_logger().info(
+                    "=== %s (failed %.1fs, attempt %d) ===\n%s: %s",
+                    caller, time.monotonic() - t0, attempt + 1, type(exc).__name__, exc,
+                )
+            if attempt < len(_RETRY_DELAYS) and _is_transient_error(exc):
+                delay = _RETRY_DELAYS[attempt] + random.uniform(0, 1.5)  # 随机抖动防惊群
+                attempt += 1
+                print(_c(f"[蓝] ⏳ 限流/网络波动，{delay:.0f}s 后自动重试 ({attempt}/{len(_RETRY_DELAYS)})", _C.YELLOW))
+                time.sleep(delay)
+                continue
+            raise
     _record_usage(resp)
     if _llm_log_enabled():
         duration = time.monotonic() - t0
@@ -921,6 +971,7 @@ SLASH_HELP = """可用斜杠命令：
   /resume        列出历史会话并恢复（等价于启动时 --resume）
   /new           强制开启新 thread（保留旧 checkpoint）
   /undo          回退最近一次审批通过的文件改动（命令/Python 副作用不可撤）
+  /retry         从断点续跑上一轮未完成的执行（异常中断/审批点均可续）
 """
 
 
@@ -962,6 +1013,10 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         return True, None
     if cmd == "/undo":
         print(_c(f"[蓝] ↩ {_undo_latest(sess.thread_id)}", _C.YELLOW))
+        return True, None
+    if cmd == "/retry":
+        if not resume_pending(graph, sess):
+            print("[蓝] 没有可续的断点（上一轮已正常结束）。")
         return True, None
     if cmd == "/resume":
         sessions = list_sessions()
@@ -1335,16 +1390,16 @@ def _undo_latest(thread_id: str) -> str:
     return "\n".join(lines)
 
 
-def _audit_log(sess: Session, decision: dict, changes: list[dict]) -> None:
-    """审批决定追加写审计日志（含拒绝/修改意见；只追加，一行一条 jsonl）。
+def _audit_log(thread_id: str, decision: dict, changes: list[dict]) -> None:
+    """审批决定追加写审计日志（含拒绝/修改/配置放行；只追加，一行一条 jsonl）。
 
-    挂在 run_round / run_round_auto 的 resume 处而非 guard 节点内——
-    guard 拿不到 thread_id（state 里没有）。写入失败不阻断主流程。
+    人工审批挂在 run_round / run_round_auto 的 resume 处；配置放行（auto_allow）
+    由 guard 节点直接写（thread_id 已在 state 里）。写入失败不阻断主流程。
     """
     try:
         record: dict = {
             "ts": datetime.now().isoformat(timespec="seconds"),
-            "thread": sess.thread_id,
+            "thread": thread_id,
             "action": decision.get("action"),
             "changes": [_shown_change(c) for c in changes],
         }
@@ -1374,6 +1429,96 @@ def _finish_round_usage(sess: Session) -> None:
         ))
 
 
+def _drain(graph, config: dict, sess: Session) -> None:
+    """审批 drain：处理 guard interrupt 直到图没有后续节点。
+
+    run_round 正常路径与 /retry 断点续跑（resume_pending）共用。
+    断在非审批点（异常中断）时直接返回——留给 /retry 续跑，不在此空转
+    （此前这里会对无 interrupt 的 cur.next 死循环，v0.7 顺手修掉）。
+    """
+    while True:
+        cur = graph.get_state(config)
+        if not cur.next:
+            break
+        interrupted = [t for t in cur.tasks if t.interrupts]
+        if not interrupted:
+            break
+        for task in interrupted:
+            payload = task.interrupts[0].value
+            print(_c("\n[蓝] ⏸ 等待你审批：", _C.YELLOW))
+            changes = payload.get("changes", [])
+            for ci, ch in enumerate(changes, 1):
+                _print_change_approval(ci, ch)
+
+            def ask(prompt: str) -> str:
+                try:
+                    return input(prompt).strip().lower()
+                except EOFError:
+                    print(_c("\n[蓝] ⏹ 输入流已关闭，按「拒绝」安全中止。", _C.RED))
+                    return "n"
+
+            # [d] 详情：看完全文后回到审批提示，不计为决策
+            # 序号选批：1,3 → 只批这几条（resume 带 indices，guard 跳过其余）
+            resume_val = {"action": "approve"}
+            while True:
+                choice = ask(_prompt("[y]全批 [n]全拒 [m]意见 [d]详情 [序号]选批 > ", _C.BRIGHT_CYAN))
+                if choice == "d":
+                    _print_changes_full(changes)
+                    continue
+                if re.fullmatch(r"[\d,\s]+", choice or "") and choice.strip(" ,"):
+                    nums = sorted({int(t) for t in re.split(r"[,\s]+", choice.strip()) if t})
+                    if nums and min(nums) >= 1 and max(nums) <= len(changes):
+                        resume_val = {"action": "approve", "indices": [n - 1 for n in nums]}
+                        break
+                    print(_c(f"  序号需在 1~{len(changes)} 之间，请重输。", _C.RED))
+                    continue
+                break
+            if choice == "n":
+                resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
+            elif choice == "m":
+                resume_val = {"action": "modify", "note": ask(_prompt("  修改意见 > ", _C.BRIGHT_CYAN))}
+            _audit_log(sess.thread_id, resume_val, changes)
+            print()
+            for chunk in graph.stream(Command(resume=resume_val), config=config, stream_mode="updates"):
+                for node_name, output in chunk.items():
+                    if node_name == "guard" and output.get("verdict") == "approved":
+                        print(_c(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}", _C.GREEN))
+                    else:
+                        _emit_step(node_name, output)
+
+
+def resume_pending(graph, sess: Session) -> bool:
+    """/retry 断点续跑：当前 thread 的 checkpoint 有未完成的业务，就从停下的地方继续。
+
+    统一覆盖三场景：①进程内图执行异常中断；②进程重启后 --resume 找回会话发现
+    有一轮没跑完；③死在 guard interrupt 审批点（续跑 = 重新弹出审批提示）。
+    返回是否有断点可续（False = 上一轮已正常跑完，空操作，绝不默默重跑）。
+
+    at-least-once 语义（已接受）：guard 节点内无中间 checkpoint，崩溃续跑会重进
+    guard，已执行的改动可能再执行一次——靠执行顺序（幂等的写文件先跑）+ 审计日志兜底。
+    """
+    cur = graph.get_state(sess.config)
+    if not cur or not cur.next:
+        return False
+    # at-least-once 提示：崩在 guard 执行途中（guard 待重跑且无 interrupt 挂起）时，
+    # 已执行的改动会再执行一次，提醒查审计日志；停在审批点（有 interrupt）时改动
+    # 尚未执行，无重复风险不提示。
+    if "guard" in cur.next and not any(t.interrupts for t in cur.tasks):
+        print(_c("[蓝] ⚠ 上次执行可能已部分完成，重复执行的改动以审计日志为准。", _C.YELLOW))
+    print(_c(f"[蓝] 🔁 从断点继续（待执行节点：{list(cur.next)}）…", _C.BLUE))
+    try:
+        for chunk in graph.stream(None, config=sess.config, stream_mode="updates"):
+            for node_name, output in chunk.items():
+                _emit_step(node_name, output)
+    except Exception:
+        traceback.print_exc()
+        _node_logger().exception("resume_pending 续跑异常（thread=%s）", sess.thread_id)
+    _drain(graph, sess.config, sess)
+    _finish_round_usage(sess)
+    _save_session_meta(sess)
+    return True
+
+
 def run_round(graph, sess: Session, request: str) -> None:
     """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
     config = sess.config
@@ -1388,62 +1533,16 @@ def run_round(graph, sess: Session, request: str) -> None:
     except Exception:
         traceback.print_exc()
         _node_logger().exception("run_round 图执行异常（thread=%s）", sess.thread_id)
-
-    while True:
-        cur = graph.get_state(config)
-        if not cur.next:
-            break
-        for task in cur.tasks:
-            if task.interrupts:
-                payload = task.interrupts[0].value
-                print(_c("\n[蓝] ⏸ 等待你审批：", _C.YELLOW))
-                changes = payload.get("changes", [])
-                for ci, ch in enumerate(changes, 1):
-                    _print_change_approval(ci, ch)
-
-                def ask(prompt: str) -> str:
-                    try:
-                        return input(prompt).strip().lower()
-                    except EOFError:
-                        print(_c("\n[蓝] ⏹ 输入流已关闭，按「拒绝」安全中止。", _C.RED))
-                        return "n"
-
-                # [d] 详情：看完全文后回到审批提示，不计为决策
-                # 序号选批：1,3 → 只批这几条（resume 带 indices，guard 跳过其余）
-                resume_val = {"action": "approve"}
-                while True:
-                    choice = ask(_prompt("[y]全批 [n]全拒 [m]意见 [d]详情 [序号]选批 > ", _C.BRIGHT_CYAN))
-                    if choice == "d":
-                        _print_changes_full(changes)
-                        continue
-                    if re.fullmatch(r"[\d,\s]+", choice or "") and choice.strip(" ,"):
-                        nums = sorted({int(t) for t in re.split(r"[,\s]+", choice.strip()) if t})
-                        if nums and min(nums) >= 1 and max(nums) <= len(changes):
-                            resume_val = {"action": "approve", "indices": [n - 1 for n in nums]}
-                            break
-                        print(_c(f"  序号需在 1~{len(changes)} 之间，请重输。", _C.RED))
-                        continue
-                    break
-                if choice == "n":
-                    resume_val = {"action": "reject", "note": ask(_prompt("  拒绝原因(可空) > ", _C.BRIGHT_CYAN)) or "用户拒绝"}
-                elif choice == "m":
-                    resume_val = {"action": "modify", "note": ask(_prompt("  修改意见 > ", _C.BRIGHT_CYAN))}
-                _audit_log(sess, resume_val, changes)
-                print()
-                for chunk in graph.stream(Command(resume=resume_val), config=config, stream_mode="updates"):
-                    for node_name, output in chunk.items():
-                        if node_name == "guard" and output.get("verdict") == "approved":
-                            print(_c(f"[蓝] ✅ 已执行：\n{output.get('feedback', '')}", _C.GREEN))
-                        else:
-                            _emit_step(node_name, output)
+        print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
+    _drain(graph, config, sess)
     _finish_round_usage(sess)
     _save_session_meta(sess)
 
 
-def run_interactive(graph, request: str | None = None) -> None:
+def run_interactive(graph, request: str | None = None, sess: Session | None = None) -> None:
     """多轮交互主循环：支持连续提需求 + 斜杠命令。"""
     register_step_callback(_print_node)  # 默认回调：CLI 打印
-    sess = Session()
+    sess = sess or Session()
     if request:
         run_round(graph, sess, request)
     print(_c("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
@@ -1504,15 +1603,13 @@ def main() -> None:
         tid = _resume_picker()
         if tid:
             sess = Session(thread_id=tid)
-            # 恢复后先展示当前状态
             cur = graph.get_state(sess.config)
             if cur and cur.next:
-                print(f"[蓝] 恢复 thread {tid}，图处于等待状态：{list(cur.next)}")
-                # 如果有 pending interrupt，继续走审批循环
-                run_round(graph, sess, "")  # 空请求不会触发新 planner，直接检查 state
+                # 找回的会话有一轮没跑完：断点续跑（等价 /retry），而非开新一轮
+                resume_pending(graph, sess)
             else:
                 print(f"[蓝] 恢复 thread {tid}，上轮已完成。输入新需求继续。")
-                run_interactive(graph)
+            run_interactive(graph, sess=sess)
             return
         # 用户取消或无效 → 落入新会话
     if args.auto_approve:
@@ -1552,7 +1649,7 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
         for task in cur.tasks:
             if task.interrupts:
                 print(_c("[蓝] ⏸ 自动审批通过", _C.DIM))
-                _audit_log(sess, {"action": "auto-approve"},
+                _audit_log(sess.thread_id, {"action": "auto-approve"},
                            task.interrupts[0].value.get("changes", []))
                 for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
                     for node_name, output in chunk.items():
