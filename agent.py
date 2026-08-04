@@ -18,6 +18,7 @@ v0.2 新增：
 v0.7 阶段一新增：
 - /retry 断点续跑（run_round 的审批循环抽为 _drain 公共函数，续跑共用）
 - _logged_invoke 对瞬时错误（429/5xx/超时/连接错误）指数退避自动重试
+- .blue.toml 权限分级（allow/ask/deny 三档，两层配置逐键合并，见 tools.py）
 
 CLI 交互在 __main__ 分支。
 """
@@ -56,6 +57,7 @@ from langgraph.types import Command, Send, interrupt
 
 from prompts import AGENT_PROMPT, PLANNER_PROMPT, REPORT_PROMPT, REVIEWER_PROMPT, WORKER_PROMPT
 from tools import (
+    ACTION_CATEGORY,
     ALL_TOOLS,
     FINAL_ANSWER_TOOL,
     PLAN_TOOL_NAMES,
@@ -64,6 +66,7 @@ from tools import (
     check_command_safety,
     check_python_safety,
     execute_change,
+    permission_for_action,
 )
 
 MAX_REVIEW_ROUNDS = 3
@@ -348,6 +351,26 @@ def planner(state: AgentState) -> dict:
             "executed_changes": [], "changed_files": []}
 
 
+def _precheck_plan_tool(name: str, args: dict) -> str | None:
+    """plan_* 暂存前校验（agent 与 worker 共用，返回拦截原因；None = 通过）。
+
+    - plan_run_command：危险关键词/白名单 + cwd 沙箱
+    - plan_run_python：ast 静态检查
+    - .blue.toml deny：暂存即拒，反馈模型换方案（execute_change 还有最后防线）
+    """
+    try:
+        if name == "plan_run_command":
+            check_command_safety(args.get("command", ""))
+            _resolve(args.get("cwd", "."))
+        elif name == "plan_run_python":
+            check_python_safety(args.get("code", ""))
+    except ValueError as exc:
+        return str(exc)
+    if permission_for_action(name) == "deny":
+        return f"此类操作被 .blue.toml 配置禁止（{ACTION_CATEGORY.get(name, '')}=deny），请换方案"
+    return None
+
+
 def agent(state: AgentState) -> dict:
     tip = f"计划：{json.dumps(state['plan'], ensure_ascii=False)}；当前第 {state['current_step'] + 1}/{len(state['plan'])} 步。"
     if state.get("verdict") in ("revise", "rejected") and state.get("feedback"):
@@ -388,18 +411,7 @@ def agent(state: AgentState) -> dict:
                 updated.append(AIMessage(content=answer_text))
                 return {"messages": updated, "pending_changes": pending, "current_step": step}
             if name in PLAN_TOOL_NAMES:
-                blocked = None
-                if name == "plan_run_command":
-                    try:
-                        check_command_safety(args.get("command", ""))
-                        _resolve(args.get("cwd", "."))
-                    except ValueError as exc:
-                        blocked = str(exc)
-                elif name == "plan_run_python":
-                    try:
-                        check_python_safety(args.get("code", ""))
-                    except ValueError as exc:
-                        blocked = str(exc)
+                blocked = _precheck_plan_tool(name, args)
                 if blocked:
                     tool_msg = ToolMessage(
                         content=f"被拦截：{blocked} 请修正后重试。",
@@ -483,18 +495,7 @@ def worker(state: AgentState) -> dict:
                     return _worker_result(subtask, note, pending)
                 if name in PLAN_TOOL_NAMES:
                     # 与 agent 节点一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
-                    blocked = None
-                    if name == "plan_run_command":
-                        try:
-                            check_command_safety(args.get("command", ""))
-                            _resolve(args.get("cwd", "."))
-                        except ValueError as exc:
-                            blocked = str(exc)
-                    elif name == "plan_run_python":
-                        try:
-                            check_python_safety(args.get("code", ""))
-                        except ValueError as exc:
-                            blocked = str(exc)
+                    blocked = _precheck_plan_tool(name, args)
                     if blocked:
                         messages.append(ToolMessage(
                             content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"]))
@@ -516,12 +517,51 @@ def worker(state: AgentState) -> dict:
         return _worker_result(subtask, f"子任务失败：{type(exc).__name__}: {exc}", [])
 
 
+# guard 执行 pending_changes 的固定顺序：写文件类（幂等）在前，命令/Python 在后。
+# /retry 断点续跑是 at-least-once：崩溃续跑会重进 guard，已执行的改动可能再执行一次，
+# 幂等的写文件先跑可最大限度降低重复执行的副作用。
+_EXEC_ORDER = {"plan_write_file": 0, "plan_patch": 0, "plan_run_command": 1, "plan_run_python": 1}
+
+
+def _execution_order(changes: list[dict]) -> list[dict]:
+    """稳定排序：写文件类在前、命令/Python 在后，同组内保持原有顺序。"""
+    return sorted(changes, key=lambda c: _EXEC_ORDER.get(c.get("action", ""), 2))
+
+
+def _execute_approved(changes: list[dict], state: AgentState) -> tuple[str, list[str]]:
+    """执行已批准（人工审批或配置放行）的改动：固定顺序 + 执行前快照。
+    返回 (summary, changed_files)。"""
+    ordered = _execution_order(changes)
+    changed_files = [c.get("path", "") for c in ordered if c.get("path")]
+    # /undo 快照：必须在 execute_change 之前（备份的是改动前的内容）
+    snap_note = ""
+    if changed_files and _snapshot_files(changed_files, state.get("thread_id", ""), state["request"]):
+        snap_note = "\n\n【快照】改动前文件已备份（/undo 可回退；命令/Python 副作用不可撤）"
+    summary = "\n".join(execute_change(c) for c in ordered) + snap_note
+    return summary, changed_files
+
+
 def guard(state: AgentState) -> dict:
     if not state.get("pending_changes"):
         notes = "；".join(state.get("worker_notes", []))
         return {"verdict": "proceed", "pending_changes": [], "feedback": notes,
                 "executed_changes": [], "changed_files": []}
-    answer = interrupt({"changes": state["pending_changes"], "question": "以上改动/命令是否允许执行？"})
+    pending = list(state["pending_changes"])
+    # v0.7 权限分级：整批都是配置 allow 的类别时跳过 interrupt 直接执行，审计记 auto_allow；
+    # 混合批次（含 ask 类别）保守起见整批走人工审批。deny 在暂存层/execute_change 已拦。
+    if all(permission_for_action(c.get("action", "")) == "allow" for c in pending):
+        cats = "、".join(sorted({ACTION_CATEGORY.get(c.get("action", ""), "?") for c in pending}))
+        print(_c(f"[蓝] ⚡ 配置放行（{cats}=allow）：直接执行 {len(pending)} 项改动", _C.DIM))
+        _audit_log(state.get("thread_id", ""), {"action": "auto_allow"}, pending)
+        ordered = _execution_order(pending)
+        summary, changed_files = _execute_approved(ordered, state)
+        if changed_files:
+            summary += f"\n\n【改动文件】{'; '.join(changed_files)}"
+        if state.get("worker_notes"):
+            summary += "\n\n【并行子任务】\n" + "\n".join(state["worker_notes"])
+        return {"verdict": "approved", "pending_changes": [], "feedback": summary,
+                "executed_changes": ordered, "changed_files": changed_files}
+    answer = interrupt({"changes": pending, "question": "以上改动/命令是否允许执行？"})
     action = answer.get("action") if isinstance(answer, dict) else "approve"
     if action == "reject":
         return {"verdict": "rejected", "pending_changes": [], "feedback": answer.get("note", "用户拒绝"),
@@ -532,20 +572,15 @@ def guard(state: AgentState) -> dict:
     # 执行前留存完整改动清单：reviewer 看 diff、report 列清单、verifier 读 changed_files。
     # pending_changes 随后清空，不存一份的话下游全拿不到改了什么（P1 实测坑）。
     # 逐条审批：resume 带 indices（0 起）时只执行批准的条目，跳过的记入 feedback。
-    all_changes = list(state["pending_changes"])
     indices = answer.get("indices")
     if isinstance(indices, list) and indices:
         idx_set = {int(i) for i in indices}
-        executed = [c for i, c in enumerate(all_changes) if i in idx_set]
-        skipped = [c for i, c in enumerate(all_changes) if i not in idx_set]
+        executed = [c for i, c in enumerate(pending) if i in idx_set]
+        skipped = [c for i, c in enumerate(pending) if i not in idx_set]
     else:
-        executed, skipped = all_changes, []
-    changed_files = [c.get("path", "") for c in executed if c.get("path")]
-    # /undo 快照：必须在 execute_change 之前（备份的是改动前的内容）
-    snap_note = ""
-    if changed_files and _snapshot_files(changed_files, state.get("thread_id", ""), state["request"]):
-        snap_note = "\n\n【快照】改动前文件已备份（/undo 可回退；命令/Python 副作用不可撤）"
-    summary = "\n".join(execute_change(c) for c in executed) + snap_note
+        executed, skipped = pending, []
+    ordered = _execution_order(executed)
+    summary, changed_files = _execute_approved(ordered, state)
     if skipped:
         skipped_desc = "; ".join(
             f"{c.get('action')}({c.get('path') or c.get('command', '')})" for c in skipped
@@ -556,7 +591,7 @@ def guard(state: AgentState) -> dict:
     if state.get("worker_notes"):
         summary += "\n\n【并行子任务】\n" + "\n".join(state["worker_notes"])
     return {"verdict": "approved", "pending_changes": [], "feedback": summary,
-            "executed_changes": executed, "changed_files": changed_files}
+            "executed_changes": ordered, "changed_files": changed_files}
 
 
 def _compress_messages(messages: list, request: str) -> str:

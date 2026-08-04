@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Literal
 
@@ -39,6 +40,78 @@ _BLOCKED_COMMAND_PATTERNS = [
 ]
 
 _DEFAULT_TIMEOUT = 60  # 命令默认超时（秒）
+
+# ─────────────────────────── .blue.toml 权限分级（v0.7，最小静态版） ───────────────────────────
+# 两层配置逐键合并：全局 ~/.blue/config.toml 在前，项目 <cwd>/.blue.toml 逐键覆盖。
+#   [permissions]
+#   write   = "ask"   # plan_write_file / plan_patch
+#   command = "ask"   # plan_run_command
+#   python  = "ask"   # plan_run_python
+# 三档语义：allow 跳过 guard 审批直接执行（审计记 auto_allow）/ ask（缺省）现状人工审批 /
+# deny 双路径拒绝（agent/worker 暂存即拒 + execute_change 最后防线）。只读工具恒 allow 不可配。
+# 优先级底线：启发式危险拦截 + BLUE_COMMAND_WHITELIST + deny 不可被任何方式赦免
+# （--auto-approve 只是把 ask 当 allow，不能赦免 deny）。
+# 无缓存、每次决策点现读：运行中改配置即时生效，测试也好隔离。
+
+GLOBAL_CONFIG_PATH = os.path.join(os.path.expanduser("~/.blue"), "config.toml")
+PROJECT_CONFIG_NAME = ".blue.toml"
+
+_PERMISSION_CATEGORIES = ("write", "command", "python")
+_PERMISSION_LEVELS = ("allow", "ask", "deny")
+# plan_* 动作 → 权限类别（只读工具不在映射内，permission_for_action 对其恒返回 allow）
+ACTION_CATEGORY = {
+    "plan_write_file": "write",
+    "plan_patch": "write",
+    "plan_run_command": "command",
+    "plan_run_python": "python",
+}
+
+_config_warned: set[str] = set()  # 同一配置问题只警告一次，防每轮刷屏
+
+
+def _load_config_file(path: str) -> dict[str, str]:
+    """读单个配置文件的 [permissions] 段。
+    文件缺失 → {}；TOML 语法错误 / 值非法 → 告警一次并跳过（调用方回落 ask，fail-closed）。"""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001 — 配置解析失败绝不阻断主流程
+        if path not in _config_warned:
+            _config_warned.add(path)
+            print(f"[蓝] ⚠ 配置文件 {path} 解析失败（{exc}），权限配置回落为 ask")
+        return {}
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        return {}
+    out: dict[str, str] = {}
+    for cat in _PERMISSION_CATEGORIES:
+        val = perms.get(cat)
+        if val is None:
+            continue
+        if val in _PERMISSION_LEVELS:
+            out[cat] = val
+        elif f"{path}:{cat}" not in _config_warned:
+            _config_warned.add(f"{path}:{cat}")
+            print(f"[蓝] ⚠ 配置 {path} 中 {cat}={val!r} 非法（应为 allow/ask/deny），该项回落为 ask")
+    return out
+
+
+def load_permissions() -> dict[str, str]:
+    """合并两层配置返回 {类别: 级别}：项目级逐键覆盖全局，缺键回落 ask。"""
+    merged = {cat: "ask" for cat in _PERMISSION_CATEGORIES}
+    merged.update(_load_config_file(GLOBAL_CONFIG_PATH))
+    merged.update(_load_config_file(str(WORKDIR / PROJECT_CONFIG_NAME)))
+    return merged
+
+
+def permission_for_action(action: str) -> str:
+    """查某 plan_* 动作当前的权限级别（allow/ask/deny）。只读工具恒 allow。"""
+    cat = ACTION_CATEGORY.get(action)
+    if cat is None:
+        return "allow"  # 只读工具恒 allow 不可配
+    return load_permissions().get(cat, "ask")
 
 # ─────────────────────────── 命令白名单（借鉴 smolagents 白名单安全模型） ───────────
 # BLUE_COMMAND_WHITELIST 为空/未设置 → 仅黑名单模式（现状，宽松）
@@ -344,6 +417,10 @@ def execute_change(change: dict) -> str:
     """真正执行一条已审批的 pending_change。返回执行结果描述。"""
     action: str = change["action"]
     path: str | None = change.get("path")
+    # .blue.toml deny 最后防线（暂存层已拦一次，这里防绕过）；
+    # deny 是系统底线，人工 approve / --auto-approve 都赦免不了
+    if permission_for_action(action) == "deny":
+        return f"执行失败：此类操作被 .blue.toml 配置禁止（{ACTION_CATEGORY.get(action, '')}=deny）"
     try:
         if action == "plan_write_file":
             if not path:
