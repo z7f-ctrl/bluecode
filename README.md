@@ -58,7 +58,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | `planner` | 把需求拆成 3~6 步中文计划；简单需求（短、无多步骤词）跳过模型调用直接单步；输出 `{steps, parallel_tasks}`，完全独立的子任务 ≥2 时走并行（上限 4 个） |
 | `agent` | 手写工具循环；只读工具直接执行，写/执行工具只**暂存**到 `pending_changes`，不真动手；`final_answer` 显式终止 |
 | `worker` | 并行 worker（v0.5）：处理派发的一个独立子任务，只读+暂存不执行，产出经 reducer 聚合到 guard 一次审批 |
-| `guard` | 有待审批改动时 `interrupt()` 冻结图，等你 `y`/`n`/`m`；通过才真正执行；`--auto-approve` 模式下自动放行 |
+| `guard` | 有待审批改动时 `interrupt()` 冻结图，等你 `y`/`n`/`m`；通过才真正执行；`--auto-approve` 模式下自动放行；`.blue.toml` 配置 `allow` 的类别跳过审批直接执行（审计记 `auto_allow`），`deny` 的类别暂存即拒 |
 | `verifier` | 审批通过后自动验证：`py_compile` 语法检查改动文件 + 自动发现并跑 pytest（最多 3 个文件，30s 超时），结果追加到 feedback |
 | `reviewer` | 自审：`verdict: pass / revise`，revise 弹回 agent 重改（上限 3 轮）；判定有 verifier 的客观验证结果做依据 |
 | `report` | 汇总改动清单 + 评审轮数 + 验证/执行结果，输出 Markdown 交付报告 |
@@ -139,10 +139,11 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 20 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 25 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
-# executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退
+# executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
+# LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -176,7 +177,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.5 | 多文件并行修改：`Send` 扇出 worker + reducer 聚合 + 一次性审批 | ✅ 已实现 |
 | v0.5.x | 日志两层 + token 追踪 + 滑动窗口 + 安全加固 + CLI 颜色 + executed_changes + 审批预览/详情 + 工具易用性 | ✅ 已实现 |
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
-| v0.7 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、权限分级 `.blue.toml`（allow/ask/deny）、`/retry` 失败恢复 | 未实现 |
+| v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
+| v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检（触发条件：自用达可用门槛） | 未实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
@@ -209,7 +211,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 > /quit          # 退出
 ```
 
-可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo`。
+可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）。
 
 `/undo` 回退最近一次审批通过的文件改动：guard 执行前自动把 `changed_files` 快照到 `~/.blue/backups/<thread>/<ts>/`（已存在文件备份内容、新建文件记录路径），undo 时写回+删除。**边界：仅 `plan_write_file`/`plan_patch` 可撤；`plan_run_command`/`plan_run_python` 的副作用（装包、删文件、系统状态）不在快照内，不可撤。**单轮指针（只撤最近一轮），快照目录保留在磁盘可手动翻。
 
