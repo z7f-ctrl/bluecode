@@ -985,6 +985,71 @@ def test_cross_round_context():
     print("PASS cross-round context（历史需求可见 + 超阈值压缩摘要 + 摘要保留需求）✔\n")
 
 
+def test_web_search_readonly():
+    """web_search：只读免审批直接执行；结果整形（编号 + 摘要截 200）；无 key 返回引导文本不抛异常。"""
+    import tools
+    # 无 key → 引导文本（不抛异常，防模型编造结果）
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TAVILY_API_KEY", None)
+        out = tools.web_search.invoke({"query": "x"})
+        assert "TAVILY_API_KEY" in out and "不要编造" in out, f"无 key 应返回引导文本：{out}"
+    # 有 key + fake 后端 → 走通图内只读直执行
+    fake_results = [
+        {"title": "结果一", "url": "https://a.example", "content": "甲" * 300},
+        {"title": "结果二", "url": "https://b.example", "content": "短摘要"},
+    ]
+    calls = [
+        AIMessage(content='["联网查"]'),
+        AIMessage(content="查一下", tool_calls=[
+            {"name": "web_search", "args": {"query": "LangGraph 最新版本"}, "id": "s1"}]),
+        AIMessage(content="查完，最终答复：完成。"),
+    ]
+    fake = RecordingFake(calls)
+    with patch("tools._tavily_search", lambda q, n: fake_results), \
+         patch.dict(os.environ, {"TAVILY_API_KEY": "dummy"}):
+        order, state = run_on(fake, "查一下 LangGraph 最新版本", thread_id="ws-test")
+    assert state["verdict"] == "pass"
+    assert state["pending_changes"] == [], "只读搜索不应有 pending"
+    agent_round2 = fake.inputs[2]  # agent 第二次调用应带着搜索结果
+    assert "结果一" in agent_round2 and "https://a.example" in agent_round2
+    assert "甲" * 200 + "…" in agent_round2, "摘要应截断到 200 字符"
+    assert "甲" * 201 not in agent_round2
+    print("PASS web_search（只读直执行 + 摘要截断 + 无 key 引导文本）✔\n")
+
+
+def test_web_fetch():
+    """web_fetch：HTML 转纯文本（去 script/style）、边界标记、截断；私网/非法协议拒绝。"""
+    import tools
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://127.0.0.1/admin"})
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://192.168.1.1/"})
+    assert "仅支持" in tools.web_fetch.invoke({"url": "file:///etc/passwd"})
+
+    html = (b"<html><head><style>body{color:red}</style></head><body>"
+            b"<h1>\xe6\xa0\x87\xe9\xa2\x98</h1><p>\xe6\xad\xa3\xe6\x96\x87</p>"
+            b"<script>alert(1)</script></body></html>")
+
+    class FakeResp:
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        payload = html
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n=-1): return self.payload
+
+    with patch("urllib.request.urlopen", lambda *a, **k: FakeResp()):
+        out = tools.web_fetch.invoke({"url": "https://example.com/page"})
+    assert "【网页内容开始" in out and "【网页内容结束】" in out, "应有注入防护边界标记"
+    assert "标题" in out and "正文" in out
+    assert "alert" not in out and "color" not in out, "script/style 应被剔除"
+
+    class BigResp(FakeResp):
+        payload = b"<body><p>" + b"x" * 5000 + b"</p></body>"
+
+    with patch("urllib.request.urlopen", lambda *a, **k: BigResp()):
+        out = tools.web_fetch.invoke({"url": "https://example.com/big", "max_chars": 100})
+    assert "已截断" in out, "超长正文应截断"
+    print("PASS web_fetch（HTML 转文本 + 边界标记 + 截断 + 私网拒绝）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1013,6 +1078,8 @@ if __name__ == "__main__":
         test_permission_deny_and_fallback()
         test_execution_order_files_first()
         test_cross_round_context()
+        test_web_search_readonly()
+        test_web_fetch()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
