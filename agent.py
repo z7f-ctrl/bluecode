@@ -435,6 +435,11 @@ def agent(state: AgentState) -> dict:
         updated.append(ai)
         if not ai.tool_calls:
             break
+        # 只读工具结果（本 AI 消息）：ToolNode 一次执行全部只读调用后按
+        # tool_call_id 取回——此前在循环里每个 tc 都 invoke 一次，而 ToolNode
+        # 每次都执行 AI 消息里的全部调用，N 个并行调用产生 N² 条 ToolMessage
+        # （同一 tool_call_id 重复），被网关按非法请求 400 拒掉（glm 实测）
+        ro_results: dict | None = None
         for tc in ai.tool_calls:
             name, args = tc.get("name"), tc.get("args") or {}
             if name == FINAL_ANSWER_TOOL:
@@ -474,11 +479,14 @@ def agent(state: AgentState) -> dict:
                 messages.append(tool_msg)
                 updated.append(tool_msg)
             else:
-                tool_messages = tool_node.invoke(messages)
-                tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
-                for tm in tool_messages:
-                    messages.append(tm)
-                    updated.append(tm)
+                if ro_results is None:
+                    tms = tool_node.invoke(messages)
+                    tms = tms if isinstance(tms, list) else tms.get("messages", [])
+                    ro_results = {tm.tool_call_id: tm for tm in tms}
+                tool_msg = ro_results.get(tc["id"])
+                if tool_msg is not None:
+                    messages.append(tool_msg)
+                    updated.append(tool_msg)
         # 计划步只在一批改动攒出（即将进入审批）时推进：
         # 此前每次工具迭代都自增，step 语义实际是「迭代计数」，
         # 与 tip 里「当前第 N/M 步」的计划步含义不符
@@ -525,6 +533,8 @@ def worker(state: AgentState) -> dict:
             messages.append(ai)
             if not ai.tool_calls:
                 break
+            # 只读工具结果按 tool_call_id 取回（N² 重复修复，同 agent 节点）
+            ro_results: dict | None = None
             for tc in ai.tool_calls:
                 name, args = tc.get("name"), tc.get("args") or {}
                 if name == FINAL_ANSWER_TOOL:
@@ -544,9 +554,13 @@ def worker(state: AgentState) -> dict:
                         content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
                         tool_call_id=tc["id"]))
                 else:
-                    tool_messages = tool_node.invoke(messages)
-                    tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
-                    messages.extend(tool_messages)
+                    if ro_results is None:
+                        tms = tool_node.invoke(messages)
+                        tms = tms if isinstance(tms, list) else tms.get("messages", [])
+                        ro_results = {tm.tool_call_id: tm for tm in tms}
+                    tool_msg = ro_results.get(tc["id"])
+                    if tool_msg is not None:
+                        messages.append(tool_msg)
             if pending:
                 break
         note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
