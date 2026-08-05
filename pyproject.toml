@@ -1,0 +1,30 @@
+# bluecode（小蓝）打包配置（v0.7 阶段二）
+# pipx 安装：pipx install . → 全局可用 blue 命令（blue "需求" / blue init / blue doctor）
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bluecode"
+version = "0.7.0"
+description = "小蓝 Blue —— 基于 LangGraph 的本地个人 coding agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.2",
+    "langgraph-checkpoint-sqlite>=3.1",
+    "langchain-openai>=1.4",
+    "langchain-core>=1.5",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+fancy = ["rich"]      # 审批详情的 diff 渲染/语法高亮（缺失自动降级纯文本）
+graph = ["grandalf"]  # blue --show-graph 打印图拓扑
+
+# 平铺脚本项目：无包目录，三个顶层模块
+[project.scripts]
+blue = "agent:main"
+
+[tool.setuptools]
+py-modules = ["agent", "tools", "prompts"]

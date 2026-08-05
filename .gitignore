@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+build/      # pip install . 构建产物
+dist/
 
 # 含本地环境细节/历史 key 前缀，不入库（本地 AI 开发文档）
 AGENTS.md
