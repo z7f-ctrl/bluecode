@@ -129,9 +129,12 @@ _COMMAND_WHITELIST: set[str] = {
 def _command_head(command: str) -> str:
     """取命令第一个 token（去掉常见 env 前缀）。"""
     tokens = command.strip().split()
-    # 跳过 VAR=value 前缀和 env 命令
+    # 跳过 VAR=value 前缀和 env 命令；括号必须包住 or 两侧——
+    # 此前 and 优先级高于 or，i 越界后 or 右侧仍求值 tokens[i] → IndexError
     i = 0
-    while i < len(tokens) and ("=" in tokens[i] and not tokens[i].startswith("-")) or tokens[i] == "env":
+    while i < len(tokens) and (
+        ("=" in tokens[i] and not tokens[i].startswith("-")) or tokens[i] == "env"
+    ):
         i += 1
     return tokens[i] if i < len(tokens) else ""
 
