@@ -7,30 +7,28 @@
 ## 快速开始
 
 ```bash
-# 1. 进入虚拟环境（如有）
+# 方式一（推荐，v0.7 起）：pipx 安装为全局命令
+pipx install .
+blue init       # 交互式配置（key 不回显，写 ~/.blue/.env，任意目录可用）
+blue doctor     # 自检：环境/依赖/配置/API 可达/模型存在/tool calling
+blue "给 hello.py 加上错误处理，并写一个 pytest 测试"
+
+# 方式二：源码直跑
 source <你的 venv 路径>/bin/activate
-
-# 2. 安装依赖
 pip install -r requirements.txt
-
-# 3. 配置模型（任意 OpenAI 兼容端点）
 cp .env.example .env   # 然后编辑 .env，填入真实值（.env 已被 .gitignore 排除，不入库）
-# 或直接走环境变量：
-# export OPENAI_API_KEY=sk-xxx
-# export OPENAI_BASE_URL=<你的 OpenAI 兼容端点>
-# export MODEL_NAME=<你的模型名>
-# 两种方式等效，agent.py 会自动加载 .env；显式环境变量优先于 .env。
-
-# 4. 跑一个需求
 python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 ```
+
+配置三层优先级：显式环境变量 > 项目 `.env`（cwd）> 全局 `~/.blue/.env`（`blue init` 写入处）。
 
 ### 基本命令
 
 | 命令 | 作用 |
 |---|---|
+| `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（20 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（30 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -180,7 +178,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.5.x | 日志两层 + token 追踪 + 滑动窗口 + 安全加固 + CLI 颜色 + executed_changes + 审批预览/详情 + 工具易用性 | ✅ 已实现 |
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
-| v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检（触发条件：自用达可用门槛） | 未实现 |
+| v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
