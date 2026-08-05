@@ -8,7 +8,7 @@ import tempfile
 from unittest.mock import patch
 
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 # 在 import agent 之前把 DB_PATH 指到临时文件，避免测试写入用户真实数据库
@@ -1132,6 +1132,27 @@ def test_init_writes_env():
     print("PASS blue init（写全局 env + 600 权限 + 覆盖备份 + 拒绝不动）✔\n")
 
 
+def test_parallel_readonly_tool_calls_no_duplication():
+    """一条 AI 消息带 N 个并行只读 tool_calls：ToolNode 只执行一次，
+    每个 tool_call_id 恰好一条 ToolMessage（N² 重复会被网关按非法请求 400 拒，glm 实测）。"""
+    calls = [
+        AIMessage(content='["并行查"]'),
+        AIMessage(content="并行查三个", tool_calls=[
+            {"name": "grep", "args": {"pattern": "hello"}, "id": "r1"},
+            {"name": "grep", "args": {"pattern": "agent"}, "id": "r2"},
+            {"name": "list_files", "args": {"dir": "."}, "id": "r3"},
+        ]),
+        AIMessage(content="查完，最终答复：完成。"),
+    ]
+    order, state = run_on(FakeModel(calls), "并行查三个东西", thread_id="par-ro-test")
+    assert state["verdict"] == "pass"
+    tool_msgs = [m for m in state["messages"] if isinstance(m, ToolMessage)]
+    ids = [tm.tool_call_id for tm in tool_msgs]
+    assert sorted(ids) == ["r1", "r2", "r3"], \
+        f"每个 tool_call_id 应恰好一条 ToolMessage，实际 {ids}（重复=ToolNode 被调了多次）"
+    print("PASS parallel read-only calls（N 个并行调用无 N² ToolMessage 重复）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1164,6 +1185,7 @@ if __name__ == "__main__":
         test_web_fetch()
         test_doctor_checks()
         test_init_writes_env()
+        test_parallel_readonly_tool_calls_no_duplication()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
