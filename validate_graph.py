@@ -1050,6 +1050,88 @@ def test_web_fetch():
     print("PASS web_fetch（HTML 转文本 + 边界标记 + 截断 + 私网拒绝）✔\n")
 
 
+def test_doctor_checks():
+    """doctor 各自检项判定逻辑（网络 patch 在 _fetch_model_ids / _make_plain_model 边界）。"""
+    import urllib.error
+    # 配置缺失 / 齐全
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "MODEL_NAME": ""}):
+        ok, msg = agent._check_config()
+        assert not ok and "配置缺失" in msg
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "https://x/v1",
+                                 "MODEL_NAME": "m1"}):
+        ok, _ = agent._check_config()
+        assert ok
+        with patch("agent._fetch_model_ids", lambda: ["m1", "m2"]):
+            ok, msg = agent._check_api_and_model()
+            assert ok and "m1" in msg
+        with patch("agent._fetch_model_ids", lambda: ["m2", "m1-pro"]):
+            ok, msg = agent._check_api_and_model()
+            assert not ok and "相近" in msg and "m1-pro" in msg, "应给出相近模型提示"
+        err401 = urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        with patch("agent._fetch_model_ids", side_effect=err401):
+            ok, msg = agent._check_api_and_model()
+            assert not ok and "认证失败" in msg
+        err404 = urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+        with patch("agent._fetch_model_ids", side_effect=err404):
+            ok, msg = agent._check_api_and_model()
+            assert not ok and "OPENAI_BASE_URL" in msg, "404 应指向 base_url 路径 typo"
+        with patch("agent._fetch_model_ids", side_effect=ConnectionError("refused")):
+            ok, msg = agent._check_api_and_model()
+            assert not ok and "不可达" in msg
+        # tool calling 探测
+        class TCFake:
+            def bind_tools(self, ts): return self
+            def invoke(self, msgs):
+                return AIMessage(content="", tool_calls=[
+                    {"name": "_ping", "args": {"x": "ok"}, "id": "p1"}])
+        class NoTCFake(TCFake):
+            def invoke(self, msgs): return AIMessage(content="我不会调工具")
+        with patch("agent._make_plain_model", lambda: TCFake()):
+            ok, _ = agent._check_tool_calling()
+            assert ok
+        with patch("agent._make_plain_model", lambda: NoTCFake()):
+            ok, msg = agent._check_tool_calling()
+            assert not ok and "tool_calls" in msg
+    print("PASS doctor checks（配置/API/模型/tool calling 判定 + 401/404/不可达分流）✔\n")
+
+
+def test_init_writes_env():
+    """blue init：getpass 不回显收集 → 写全局 .env（权限 600 + 覆盖前备份）→ 接 doctor；
+    已有文件时拒绝覆盖则不动。"""
+    import stat
+    with tempfile.TemporaryDirectory() as td:
+        env_path = os.path.join(td, ".env")
+        with patch("agent.ENV_GLOBAL_PATH", env_path), \
+             patch("builtins.input", lambda *a, **k: next(inputs)), \
+             patch("getpass.getpass", lambda *a, **k: next(secrets_)), \
+             patch("agent.cmd_doctor", lambda: 0):
+            # ① 全新写入
+            inputs = iter(["https://api.example/v1", "test-model"])
+            secrets_ = iter(["sk-test", "tv-test"])
+            assert agent.cmd_init() == 0
+            with open(env_path, encoding="utf-8") as f:
+                body = f.read()
+            assert "OPENAI_BASE_URL=https://api.example/v1" in body
+            assert "MODEL_NAME=test-model" in body and "OPENAI_API_KEY=sk-test" in body
+            mode = stat.S_IMODE(os.stat(env_path).st_mode)
+            assert mode == 0o600, f".env 权限应为 600，实际 {oct(mode)}"
+            # ② 已有文件 + 拒绝覆盖 → 不动
+            inputs = iter(["n"])
+            assert agent.cmd_init() == 1
+            with open(env_path, encoding="utf-8") as f:
+                assert f.read() == body, "拒绝覆盖后文件不应变化"
+            # ③ 已有文件 + 确认覆盖 → 备份 .bak
+            inputs = iter(["y", "https://api2.example/v1", "m2"])
+            secrets_ = iter(["sk-2", ""])
+            assert agent.cmd_init() == 0
+            assert os.path.exists(env_path + ".bak"), "覆盖前应备份 .bak"
+            with open(env_path, encoding="utf-8") as f:
+                assert "MODEL_NAME=m2" in f.read()
+            with open(env_path + ".bak", encoding="utf-8") as f:
+                assert "MODEL_NAME=test-model" in f.read(), "备份应保留旧值"
+    print("PASS blue init（写全局 env + 600 权限 + 覆盖备份 + 拒绝不动）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1080,6 +1162,8 @@ if __name__ == "__main__":
         test_cross_round_context()
         test_web_search_readonly()
         test_web_fetch()
+        test_doctor_checks()
+        test_init_writes_env()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
