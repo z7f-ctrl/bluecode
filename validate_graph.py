@@ -1153,6 +1153,21 @@ def test_parallel_readonly_tool_calls_no_duplication():
     print("PASS parallel read-only calls（N 个并行调用无 N² ToolMessage 重复）✔\n")
 
 
+def test_command_head_precedence():
+    """_command_head 边界：单 token 含 = 或单独 env 时不得 IndexError（or 两侧曾被
+    and 优先级吞掉 i 越界守卫）；VAR=/env 前缀正确跳过，flag 形态 token 不跳过。"""
+    import tools
+    assert tools._command_head("VAR=val") == ""           # 曾 IndexError
+    assert tools._command_head("env") == ""               # 曾 IndexError
+    assert tools._command_head("env VAR=1 python3 x.py") == "python3"
+    assert tools._command_head("FOO=bar ls -l") == "ls"
+    assert tools._command_head("FOO=bar env pytest") == "pytest"
+    assert tools._command_head("ls -la") == "ls"
+    assert tools._command_head("-x=1 cmd") == "-x=1"      # flag 形态不跳过
+    assert tools._command_head("") == ""
+    print("PASS command head（越界不崩 + VAR=/env 前缀跳过 + flag 不跳过）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1186,6 +1201,7 @@ if __name__ == "__main__":
         test_doctor_checks()
         test_init_writes_env()
         test_parallel_readonly_tool_calls_no_duplication()
+        test_command_head_precedence()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件
