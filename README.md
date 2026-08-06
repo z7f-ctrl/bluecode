@@ -28,7 +28,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 |---|---|
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（32 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（34 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -90,9 +90,9 @@ class AgentState(TypedDict):
 |---|---|
 | `list_files` | 列目录（沙箱内） |
 | `read_file` | 带行号读取（单次最多 500 行） |
-| `grep` | 正则搜索（最多 50 条，单行截断 200 字符防 minified 长行） |
+| `grep` | 正则搜索（最多 50 条，单行截断 200 字符防 minified 长行；单文件 >10MB 跳过并提示，防巨型日志/数据文件读进内存） |
 | `web_search` | 联网搜索（Tavily REST，stdlib 零新依赖；需 `TAVILY_API_KEY`，未配置返回引导文本）；摘要截 200 字符 |
-| `web_fetch` | 抓网页转纯文本（去 script/style，截 4000 字符）；私网地址拒绝 + 内容边界标记防提示注入 |
+| `web_fetch` | 抓网页转纯文本（去 script/style，截 4000 字符）；私网地址拒绝（含 IPv6 loopback 变体与 IPv4-mapped IPv6）+ 内容边界标记防提示注入 |
 | `final_answer` | 任务完成时显式终止 agent 循环，给出最终答复摘要 |
 
 暂存工具（需审批，只攒 `pending_changes` 不真执行）：
@@ -143,12 +143,13 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 32 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 34 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
 # executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
 # LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 /
-# web 搜索与抓取 / doctor 自检判定 / init 写配置 / 并行只读调用去重 / _command_head 优先级
+# web 搜索与抓取（含 SSRF IPv6 变体）/ doctor 自检判定 / init 写配置 / 并行只读调用去重 /
+# 权限批次单次读配置 / grep 大文件跳过 / _command_head 优先级
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```

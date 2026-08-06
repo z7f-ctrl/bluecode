@@ -110,12 +110,16 @@ def load_permissions() -> dict[str, str]:
     return merged
 
 
-def permission_for_action(action: str) -> str:
-    """查某 plan_* 动作当前的权限级别（allow/ask/deny）。只读工具恒 allow。"""
+def permission_for_action(action: str, perms: dict[str, str] | None = None) -> str:
+    """查某 plan_* 动作当前的权限级别（allow/ask/deny）。只读工具恒 allow。
+
+    perms 可选：传入预先 load_permissions() 的结果，避免批次内逐条重读 TOML
+    （guard 对 N 条改动判定时的用法）；不传则现读现合并（运行中改配置即时生效）。
+    """
     cat = ACTION_CATEGORY.get(action)
     if cat is None:
         return "allow"  # 只读工具恒 allow 不可配
-    return load_permissions().get(cat, "ask")
+    return (perms if perms is not None else load_permissions()).get(cat, "ask")
 
 # ─────────────────────────── 命令白名单（借鉴 smolagents 白名单安全模型） ───────────
 # BLUE_COMMAND_WHITELIST 为空/未设置 → 仅黑名单模式（现状，宽松）
@@ -183,6 +187,9 @@ def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> st
     return f"{path}（共 {total} 行，显示 {start}~{end} 行）：\n{body}{suffix}"
 
 
+_GREP_MAX_FILE_BYTES = 10 * 1024 * 1024  # grep 单文件 10MB 上限，超出跳过（防巨型日志/数据文件读进内存）
+
+
 @tool
 def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
     """在工作目录内按正则搜索文本。返回匹配的 文件名:行号:内容，最多 50 条。
@@ -196,10 +203,14 @@ def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
     except re.error as exc:
         return f"错误：无效的正则 {pattern!r}：{exc}"
     results: list[str] = []
+    skipped_big = 0  # 超大小上限跳过的文件数（防读巨型日志/数据文件进内存）
     paths = [p] if p.is_file() else sorted(p.rglob("*") if glob is None else p.glob(glob))
     for fp in paths:
         if fp.is_file():
             try:
+                if fp.stat().st_size > _GREP_MAX_FILE_BYTES:
+                    skipped_big += 1
+                    continue
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
@@ -210,8 +221,14 @@ def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
                         body = body[:200] + "…"
                     results.append(f"{fp.relative_to(WORKDIR)}:{i}:{body}")
                     if len(results) >= 50:
-                        return "\n".join(results) + "\n…（已截断，最多显示 50 条）"
-    return "\n".join(results) if results else "（无匹配）"
+                        out = "\n".join(results) + "\n…（已截断，最多显示 50 条）"
+                        if skipped_big:
+                            out += f"\n（跳过 {skipped_big} 个 >{_GREP_MAX_FILE_BYTES // 1024 // 1024}MB 的大文件）"
+                        return out
+    out = "\n".join(results) if results else "（无匹配）"
+    if skipped_big:
+        out += f"\n（跳过 {skipped_big} 个 >{_GREP_MAX_FILE_BYTES // 1024 // 1024}MB 的大文件）"
+    return out
 
 
 # ─────────────────────────── 联网工具（只读，免审批） ───────────────────────────
@@ -261,9 +278,12 @@ def web_search(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
-# 私网/本机地址（SSRF 底线）：localhost、loopback、RFC1918、link-local
+# 私网/本机地址（SSRF 底线）：localhost、loopback、RFC1918、link-local、
+# IPv6 全展开 loopback（0:0:0:0:0:0:0:1）与 IPv4-mapped IPv6（::ffff:<v4>）。
+# host 来自 urlsplit().hostname：IPv6 总是无括号小写形式（带端口/大小写无需考虑）。
 _PRIVATE_HOST = re.compile(
-    r"^(localhost|127\.|0\.0\.0\.0|\[?::1|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.)",
+    r"^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|"
+    r"\[?::1|0:0:0:0:0:0:0:1|::ffff:)",
     re.IGNORECASE,
 )
 

@@ -1022,6 +1022,11 @@ def test_web_fetch():
     import tools
     assert "拒绝" in tools.web_fetch.invoke({"url": "http://127.0.0.1/admin"})
     assert "拒绝" in tools.web_fetch.invoke({"url": "http://192.168.1.1/"})
+    # IPv6 变体：无括号 loopback / 全展开 loopback / IPv4-mapped IPv6（私网映射同样拒绝）
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://[::1]/admin"})
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://[0:0:0:0:0:0:0:1]/admin"})
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://[::ffff:127.0.0.1]/admin"})
+    assert "拒绝" in tools.web_fetch.invoke({"url": "http://[::ffff:10.0.0.1]/"})
     assert "仅支持" in tools.web_fetch.invoke({"url": "file:///etc/passwd"})
 
     html = (b"<html><head><style>body{color:red}</style></head><body>"
@@ -1153,6 +1158,77 @@ def test_parallel_readonly_tool_calls_no_duplication():
     print("PASS parallel read-only calls（N 个并行调用无 N² ToolMessage 重复）✔\n")
 
 
+def test_permission_batch_read_once():
+    """guard 批次权限判定入口读一次配置、批内复用（不逐条重读 TOML）；
+    permission_for_action 传 perms 参数时零磁盘 IO。"""
+    import tools
+    with tempfile.TemporaryDirectory() as td:
+        cfg = os.path.join(td, "config.toml")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write('[permissions]\nwrite = "allow"\n')
+        with patch("tools.GLOBAL_CONFIG_PATH", cfg), \
+             patch("tools.PROJECT_CONFIG_NAME", ".blue-test-nonexistent.toml"):
+            # ① perms 参数生效且不重读：批内判定走传入的合并结果
+            perms = tools.load_permissions()
+            calls = {"n": 0}
+            real_load = tools.load_permissions
+            def counting_load():
+                calls["n"] += 1
+                return real_load()
+            # permission_for_action 不传 perms → 现读；传 perms → 零调用
+            assert tools.permission_for_action("plan_write_file") == "allow"
+            before = calls["n"]
+            with patch("tools.load_permissions", counting_load):
+                assert tools.permission_for_action("plan_write_file", perms) == "allow"
+                assert tools.permission_for_action("plan_patch", perms) == "allow"
+                assert tools.permission_for_action("plan_run_command", perms) == "ask"
+                assert tools.permission_for_action("grep", perms) == "allow"  # 只读恒 allow
+            assert calls["n"] == before, "传 perms 后不应再调 load_permissions"
+
+            # ② guard 纯 allow 批次：整个 guard 只读一次配置（入口），不随条数放大
+            import agent
+            with patch("agent.load_permissions", counting_load):
+                st = agent.initial_state("写两文件")
+                st["thread_id"] = "batch-read-once"
+                st["pending_changes"] = [
+                    {"action": "plan_write_file", "path": "__scratch_br1__.txt", "content": "1\n"},
+                    {"action": "plan_write_file", "path": "__scratch_br2__.txt", "content": "2\n"},
+                ]
+                try:
+                    before = calls["n"]
+                    out = agent.guard(st)
+                    assert calls["n"] - before == 1, f"guard 批次应只读一次配置，实际 {calls['n'] - before}"
+                    assert out["verdict"] == "approved", f"纯 allow 批次应直批：{out['verdict']}"
+                finally:
+                    for f in ("__scratch_br1__.txt", "__scratch_br2__.txt"):
+                        if os.path.exists(f):
+                            os.remove(f)
+    print("PASS permission batch read once（perms 复用零 IO + guard 批次只读一次）✔\n")
+
+
+def test_grep_large_file_skip():
+    """grep：超过大小上限的文件跳过并提示，不读进内存；正常文件不受影响。"""
+    import tools
+    scratch_big = "__scratch_grep_big__.log"
+    scratch_small = "__scratch_grep_small__.txt"
+    try:
+        # 用小上限模拟大文件（避免真的造 10MB 文件拖慢测试）
+        with open(scratch_big, "w", encoding="utf-8") as f:
+            f.write("match-big\n" + "y" * 2000 + "\n")
+        with open(scratch_small, "w", encoding="utf-8") as f:
+            f.write("match-small\n")
+        with patch("tools._GREP_MAX_FILE_BYTES", 100):
+            out = tools.grep.invoke({"pattern": "match-", "path": "."})
+        assert "match-small" in out, f"小文件应正常命中：{out}"
+        assert "match-big" not in out, f"超上限文件应跳过：{out}"
+        assert "跳过" in out and "大文件" in out, f"应有跳过提示：{out}"
+    finally:
+        for f in (scratch_big, scratch_small):
+            if os.path.exists(f):
+                os.remove(f)
+    print("PASS grep large file skip（超上限跳过 + 提示 + 小文件不受影响）✔\n")
+
+
 def test_command_head_precedence():
     """_command_head 边界：单 token 含 = 或单独 env 时不得 IndexError（or 两侧曾被
     and 优先级吞掉 i 越界守卫）；VAR=/env 前缀正确跳过，flag 形态 token 不跳过。"""
@@ -1201,6 +1277,8 @@ if __name__ == "__main__":
         test_doctor_checks()
         test_init_writes_env()
         test_parallel_readonly_tool_calls_no_duplication()
+        test_permission_batch_read_once()
+        test_grep_large_file_skip()
         test_command_head_precedence()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:

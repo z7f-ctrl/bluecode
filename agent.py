@@ -67,6 +67,7 @@ from tools import (
     check_command_safety,
     check_python_safety,
     execute_change,
+    load_permissions,
     permission_for_action,
 )
 # 目录常量来自 session（#7 模块拆分）；这里尽早导入供本模块模块级常量定义使用。
@@ -619,7 +620,10 @@ def guard(state: AgentState) -> dict:
     pending = list(state["pending_changes"])
     # v0.7 权限分级：整批都是配置 allow 的类别时跳过 interrupt 直接执行，审计记 auto_allow；
     # 混合批次（含 ask 类别）保守起见整批走人工审批。deny 在暂存层/execute_change 已拦。
-    if all(permission_for_action(c.get("action", "")) == "allow" for c in pending):
+    # 批次入口读一次权限配置，批内复用（避免逐条重读 TOML）；每轮 guard 仍现读，
+    # 「运行中改配置即时生效」语义不变。
+    perms = load_permissions()
+    if all(permission_for_action(c.get("action", ""), perms) == "allow" for c in pending):
         cats = "、".join(sorted({ACTION_CATEGORY.get(c.get("action", ""), "?") for c in pending}))
         print(_c(f"[蓝] ⚡ 配置放行（{cats}=allow）：直接执行 {len(pending)} 项改动", _C.DIM))
         _audit_log(state.get("thread_id", ""), {"action": "auto_allow"}, pending)
