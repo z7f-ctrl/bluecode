@@ -94,7 +94,18 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(sessions):
-                new_sess = Session(thread_id=sessions[idx]["thread_id"])
+                tid = sessions[idx]["thread_id"]
+                # checkpoint 可用性探测：库被手动清理/损坏时 get_state 抛异常或返回空，
+                # 此处拦下给可读提示，而非让后续 run_round 炸在不直观的栈里
+                try:
+                    cur = graph.get_state({"configurable": {"thread_id": tid}})
+                    ok = bool(cur and (cur.values or cur.next))
+                except Exception:
+                    ok = False
+                if not ok:
+                    print(f"[蓝] ⚠ thread {tid} 的 checkpoint 已丢失或损坏，无法恢复。")
+                    return True, None
+                new_sess = Session(thread_id=tid)
                 new_sess.round = sessions[idx]["rounds"]
                 print(f"[蓝] 🔁 已恢复 thread：{new_sess.thread_id}")
                 return True, new_sess
@@ -378,8 +389,12 @@ def run_interactive(graph, request: str | None = None, sess: Session | None = No
         agent.run_round(graph, sess, line)
 
 
-def _resume_picker() -> str | None:
-    """启动时的 --resume 会话选择器。返回选中的 thread_id 或 None。"""
+def _resume_picker(graph=None) -> str | None:
+    """启动时的 --resume 会话选择器。返回选中的 thread_id 或 None。
+
+    graph 传入时做 checkpoint 可用性探测：库被清理/损坏的 thread 直接提示并
+    回落新会话，不把损坏状态带进 run_round（graph=None 仅测试/兼容路径，跳过探测）。
+    """
     sessions = list_sessions()
     if not sessions:
         print("[蓝] 暂无历史会话可恢复。")
@@ -393,7 +408,17 @@ def _resume_picker() -> str | None:
     try:
         idx = int(choice) - 1
         if 0 <= idx < len(sessions):
-            return sessions[idx]["thread_id"]
+            tid = sessions[idx]["thread_id"]
+            if graph is not None:
+                try:
+                    cur = graph.get_state({"configurable": {"thread_id": tid}})
+                    ok = bool(cur and (cur.values or cur.next))
+                except Exception:
+                    ok = False
+                if not ok:
+                    print(f"[蓝] ⚠ thread {tid} 的 checkpoint 已丢失或损坏，开启新会话。")
+                    return None
+            return tid
         print("[蓝] 序号无效，开启新会话。")
     except ValueError:
         print("[蓝] 输入无效，开启新会话。")

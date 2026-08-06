@@ -1362,7 +1362,7 @@ def main() -> None:
         print(graph.get_graph().draw_ascii())
         return
     if args.resume:
-        tid = _resume_picker()
+        tid = _resume_picker(graph)
         if tid:
             sess = Session(thread_id=tid)
             cur = graph.get_state(sess.config)

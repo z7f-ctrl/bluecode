@@ -2,7 +2,9 @@
 
 从 agent.py 拆出（#7 模块拆分）。doctor 六项自检在启动时拦下「配错端点/模型名
 不存在」的实测坑；init 交互写全局 ~/.blue/.env（key 不回显），写完接 doctor。
-运行时依赖 agent 的 _make_plain_model / _c / _C / load_dotenv，经 `import agent` 取用。
+渲染工具 _c/_C 来自 cli（模块级 import，加载顺序 agent→cli→doctor 保证无环）；
+_make_plain_model / _fetch_model_ids / ENV_GLOBAL_PATH 经函数内 `import agent` 取用
+——validate_graph.py 通过 patch("agent.X") 注入假实现，必须走 agent 命名空间解析。
 ENV_GLOBAL_PATH 来自 session（目录常量集中处）。
 """
 
@@ -16,6 +18,8 @@ import sys
 import urllib.error
 import urllib.request
 from langchain_core.messages import HumanMessage
+
+from cli import _C, _c
 
 
 def _check_python() -> tuple[bool, str]:
@@ -72,7 +76,7 @@ def _fetch_model_ids() -> list[str]:
 
 def _check_api_and_model() -> tuple[bool, str]:
     """API 可达 + key 有效 + MODEL_NAME 在可用列表（v1h typo / glm5.1 不存在的实测坑）。"""
-    import agent  # 惰性取用：避免与 agent 的循环导入（见模块 docstring）
+    import agent  # 测试契约：validate_graph patch("agent._fetch_model_ids")，必须走 agent 命名空间
     model = os.environ.get("MODEL_NAME", "").strip()
     try:
         # 经 agent 取用：validate_graph.py 等通过 patch("agent._fetch_model_ids")
@@ -94,7 +98,7 @@ def _check_api_and_model() -> tuple[bool, str]:
 
 def _check_tool_calling() -> tuple[bool, str]:
     """真实调一次最小 tool calling 请求（几个 token）：模型不支持工具调用则 agent 无法工作。"""
-    import agent  # 惰性取用（避免循环导入）
+    import agent  # 测试契约：validate_graph patch("agent._make_plain_model")，必须走 agent 命名空间
     from langchain_core.tools import tool as _lc_tool
 
     @_lc_tool
@@ -114,8 +118,7 @@ def _check_tool_calling() -> tuple[bool, str]:
 
 def cmd_doctor() -> int:
     """自检：环境/依赖/配置/数据目录/API 与模型/tool calling。返回进程退出码（0=全过）。"""
-    import agent  # 惰性取用（避免循环导入）
-    c, _C = agent._c, agent._C
+    c = _c
     checks: list[tuple[str, bool, str]] = [("Python 版本", *_check_python())]
     checks += [("依赖", ok, msg) for ok, msg in _check_deps()]
     checks.append(("配置", *_check_config()))
@@ -150,11 +153,11 @@ def _write_env_file(path: str, values: dict) -> None:
 
 def cmd_init() -> int:
     """交互式初始化：写全局 ~/.blue/.env（项目级 .env 可覆盖同名键），写完跑 doctor 验证。"""
-    import agent  # 惰性取用（避免循环导入）
-    c, _C = agent._c, agent._C
+    import agent  # ENV_GLOBAL_PATH 经 agent 取用：validate_graph 可 patch("agent.ENV_GLOBAL_PATH")
+    c = _c
     print("[蓝] ⚙ 初始化配置（写入全局 ~/.blue/.env；项目根目录的 .env 可覆盖同名键；"
           "显式环境变量优先级最高）")
-    env_path = agent.ENV_GLOBAL_PATH  # 经 agent 取用：validate_graph 可 patch("agent.ENV_GLOBAL_PATH")
+    env_path = agent.ENV_GLOBAL_PATH
     if os.path.exists(env_path):
         print(f"[蓝] 已存在 {env_path}，继续将覆盖（原文件备份为 .bak）。")
         if input("继续？[y/N] > ").strip().lower() != "y":

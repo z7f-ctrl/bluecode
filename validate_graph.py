@@ -439,7 +439,18 @@ def test_security_hardening():
     # 正常 getattr 不受影响
     r = _execute_python("print(getattr('abc', 'upper')())")
     assert "ABC" in r, f"正常 getattr 应可用，实际：{r}"
-    print("PASS security hardening（&& ; $() 反引号 / subprocess / getattr+setattr dunder）✔\n")
+
+    # 4. 沙箱 os 代理收口：system/popen/environ/chdir 均不可达（chdir 会把相对路径
+    #    操作偏出 WORKDIR 沙箱）；os.path 等安全子集不受影响
+    r = _execute_python("import os\nos.system('echo x')")
+    assert "执行失败" in r, f"os.system 应被代理拦截，实际：{r}"
+    r = _execute_python("import os\nos.chdir('/tmp')")
+    assert "执行失败" in r, f"os.chdir 应被代理拦截，实际：{r}"
+    r = _execute_python("import os\nprint(type(os.environ))")
+    assert "执行失败" in r, f"os.environ 应被代理拦截，实际：{r}"
+    r = _execute_python("import os\nprint(os.path.join('a', 'b'))")
+    assert "a/b" in r or "a\\b" in r, f"os.path 应可用，实际：{r}"
+    print("PASS security hardening（&& ; $() 反引号 / subprocess / getattr+setattr dunder / os 代理收口）✔\n")
 
 
 def test_tool_usability():
@@ -1229,6 +1240,52 @@ def test_grep_large_file_skip():
     print("PASS grep large file skip（超上限跳过 + 提示 + 小文件不受影响）✔\n")
 
 
+def test_resume_checkpoint_guard():
+    """resume 的 checkpoint 可用性探测：_resume_picker 与 /resume 选中 thread 后
+    先 get_state 探测，损坏/丢失的 checkpoint 提示并回落，不带进 run_round。"""
+    import cli
+    # ① _resume_picker：graph.get_state 抛异常（库损坏）→ 返回 None（回落新会话）
+    class BrokenGraph:
+        def get_state(self, config):
+            raise RuntimeError("sqlite disk image is malformed")
+    with patch("cli.list_sessions", lambda: [
+        {"thread_id": "blue-dead", "rounds": 1, "last_active": "x"}]), \
+         patch("builtins.input", lambda *a: "1"):
+        assert cli._resume_picker(BrokenGraph()) is None, "损坏 checkpoint 应回落 None"
+
+    # ② _resume_picker：get_state 返回空 state（从未写入）→ 同样回落
+    class EmptyGraph:
+        def get_state(self, config):
+            class S: values, next = {}, ()
+            return S()
+    with patch("cli.list_sessions", lambda: [
+        {"thread_id": "blue-empty", "rounds": 1, "last_active": "x"}]), \
+         patch("builtins.input", lambda *a: "1"):
+        assert cli._resume_picker(EmptyGraph()) is None, "空 checkpoint 应回落 None"
+
+    # ③ 正常 checkpoint → 返回 tid（探测通过）
+    class GoodGraph:
+        def get_state(self, config):
+            class S:
+                values = {"request": "x"}
+                next = ()
+            return S()
+    with patch("cli.list_sessions", lambda: [
+        {"thread_id": "blue-live", "rounds": 2, "last_active": "x"}]), \
+         patch("builtins.input", lambda *a: "1"):
+        assert cli._resume_picker(GoodGraph()) == "blue-live", "正常 checkpoint 应返回 tid"
+
+    # ④ /resume 路径：损坏 checkpoint 提示且不换 session（走 handle_slash 分支）
+    sess = agent.Session.__new__(agent.Session)
+    sess.thread_id = "blue-current"
+    with patch("cli.list_sessions", lambda: [
+        {"thread_id": "blue-dead2", "rounds": 1, "last_active": "x"}]), \
+         patch("builtins.input", lambda *a: "1"):
+        cont, new_sess = cli.handle_slash("/resume", sess, BrokenGraph())
+    assert cont and new_sess is None, "损坏 checkpoint 不应切换 session"
+    print("PASS resume checkpoint guard（损坏/空 checkpoint 探测 + 正常放行 + /resume 不切换）✔\n")
+
+
 def test_command_head_precedence():
     """_command_head 边界：单 token 含 = 或单独 env 时不得 IndexError（or 两侧曾被
     and 优先级吞掉 i 越界守卫）；VAR=/env 前缀正确跳过，flag 形态 token 不跳过。"""
@@ -1279,6 +1336,7 @@ if __name__ == "__main__":
         test_parallel_readonly_tool_calls_no_duplication()
         test_permission_batch_read_once()
         test_grep_large_file_skip()
+        test_resume_checkpoint_guard()
         test_command_head_precedence()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
