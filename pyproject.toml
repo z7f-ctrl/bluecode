@@ -22,9 +22,9 @@ dependencies = [
 fancy = ["rich"]      # 审批详情的 diff 渲染/语法高亮（缺失自动降级纯文本）
 graph = ["grandalf"]  # blue --show-graph 打印图拓扑
 
-# 平铺脚本项目：无包目录，三个顶层模块
+# 平铺脚本项目：无包目录，顶层模块（#7 模块拆分后 agent 为 facade，重导出 session/cli/doctor）
 [project.scripts]
 blue = "agent:main"
 
 [tool.setuptools]
-py-modules = ["agent", "tools", "prompts"]
+py-modules = ["agent", "tools", "prompts", "session", "cli", "doctor"]

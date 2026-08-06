@@ -442,11 +442,17 @@ def plan_run_python(code: str) -> str:
 
 
 def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-    """受限 __import__：只允许 _PYTHON_ALLOWED_IMPORTS 内的模块。"""
+    """受限 __import__：只允许 _PYTHON_ALLOWED_IMPORTS 内的模块。
+
+    os 特判为受限代理（_safe_os）：import os / from os import system 都拿不到
+    危险属性——配合命名空间直注的 os，双路径收口 system/popen/exec*/environ。
+    """
     root = name.split(".")[0]
     if root not in _PYTHON_ALLOWED_IMPORTS:
         raise ImportError(f"禁止导入模块 {root!r}（白名单：{sorted(_PYTHON_ALLOWED_IMPORTS)}）")
     import builtins as _b
+    if root == "os":
+        return _safe_os()
     return _b.__import__(name, globals, locals, fromlist, level)
 
 
@@ -492,12 +498,45 @@ def _restricted_builtins() -> dict:
     return d
 
 
+# 沙箱内允许通过 os 暴露的安全子集；其余（system/popen/exec*/environ 写）一律拦截。
+# os 在 import 白名单内（os.path 刚需），但 os.system("rm -rf /") 等可完全绕过命令
+# 校验——尤其是 --auto-approve（benchmark/CI）下 guard 审批门敞开，必须在命名空间层
+# 面把 os 收口成只读/安全的代理，而非直接暴露整个模块。
+_OS_SAFE_ATTRS = (
+    "path", "makedirs", "mkdir", "listdir", "scandir", "walk", "rmdir",
+    "remove", "unlink", "rename", "replace", "getcwd", "chdir", "stat",
+    "lstat", "exists", "isfile", "isdir", "islink", "access", "getpid",
+    "urandom", "sep", "altsep", "pathsep", "linesep", "devnull",
+)
+_OS_BLOCKED_ATTRS = ("system", "popen", "execv", "execve", "execvp", "execvpe",
+                     "execl", "execlp", "execlpe", "spawnl", "spawnle", "spawnv",
+                     "spawnve", "spawnlp", "spawnlpe", "spawnv", "environ")
+
+
+def _safe_os() -> object:
+    """返回受限 os 代理：仅暴露安全属性，拦 system/popen/exec*/environ 等。
+
+    os.environ 不暴露（防读篡改环境变量 / 泄露 API key）；要读写环境变量的需求
+    不应出现在沙箱代码里。访问被拦属性直接抛 AttributeError。
+    """
+    import os as _real_os
+    import types as _types
+
+    proxy = _types.SimpleNamespace()
+    for name in _OS_SAFE_ATTRS:
+        if hasattr(_real_os, name):
+            setattr(proxy, name, getattr(_real_os, name))
+    return proxy
+
+
 def _execute_python(code: str) -> str:
     """在受限命名空间执行已审批的 Python 代码，捕获 stdout。"""
     check_python_safety(code)  # 最后防线
     namespace: dict = {"__builtins__": _restricted_builtins()}
     # 注入受限的工作目录上下文
     namespace["WORKDIR"] = WORKDIR
+    # 受限 os 代理：只暴露安全子集，屏蔽 system/popen/exec*/environ（见 _safe_os）
+    namespace["os"] = _safe_os()
     stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
@@ -595,3 +634,6 @@ def execute_change(change: dict) -> str:
         return f"未知动作 {action}"
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         return f"执行失败：{exc}"
+    except Exception as exc:  # noqa: BLE001 — guard 内最后防线：任何意外异常都应
+        # 变成可读错误文本返回给 reviewer，而非穿透 guard 炸掉整轮
+        return f"执行失败：{type(exc).__name__}: {exc}"

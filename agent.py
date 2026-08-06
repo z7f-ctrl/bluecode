@@ -26,22 +26,18 @@ CLI 交互在 __main__ 分支。
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import logging
 import os
 import random
 import re
 import shutil
-import sqlite3
 import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
-import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
@@ -73,13 +69,18 @@ from tools import (
     execute_change,
     permission_for_action,
 )
+# 目录常量来自 session（#7 模块拆分）；这里尽早导入供本模块模块级常量定义使用。
+from session import (
+    BLUE_DIR, DB_PATH, AUDIT_LOG, BACKUP_ROOT, ENV_GLOBAL_PATH,
+)
 
 MAX_REVIEW_ROUNDS = 3
 MAX_TOOL_ITERATIONS = 15
 MAX_WORKER_ITERATIONS = 8   # 并行 worker 的工具循环上限（比串行 agent 小，防限流下耗时失控）
 MAX_PARALLEL_WORKERS = 4    # 并行 worker 数量上限（实测 API 限流，不宜更高）
-BLUE_DIR = os.path.expanduser("~/.blue")
-DB_PATH = os.path.join(BLUE_DIR, "checkpoints.sqlite")
+RESUME_STREAM_TIMEOUT = 60.0  # /retry 断点续跑的墙钟超时（秒）：节点崩溃后续跑可能永不返回（忙等占满 CPU），靠超时熔断
+# 目录常量（BLUE_DIR/DB_PATH/AUDIT_LOG/BACKUP_ROOT/ENV_GLOBAL_PATH）已迁至 session.py，
+# 经文件末尾 `from session import *` 重导出，保持 agent.X 可访问（测试 patch 用）。
 
 
 def _resettable_add(old: list, new: list) -> list:
@@ -400,6 +401,90 @@ def _precheck_plan_tool(name: str, args: dict) -> str | None:
     return None
 
 
+def _tool_loop_core(messages, *, max_iter, head_len, request,
+                    emit, finalize, on_final_answer, caller):
+    """agent / worker 共享的工具循环内核（消除两处重复维护，N² 修复只此一份）。
+
+    持有：迭代循环 + _sliding_compress + _logged_invoke + tool_calls 分发
+    （final_answer / 计划工具双路径校验 _precheck_plan_tool / 只读 N² 安全取回）
+    + 首批 pending 即 break。差异通过回调外置：
+      emit(msg)            —— 把消息登记进返回的 state 增量（agent 写 updated；
+                              worker 传 None，messages 仅内部累积不返回）。
+      finalize(pending, hit_cap) —— 构造返回值 dict（step 推进 / worker note /
+                              迭代上限提示等差异）。
+      on_final_answer(args, pending) —— final_answer 处理；返回 dict 即提前结束
+                              整轮（agent 需 invoke tool_node 取真实结果并写
+                              updated；worker 仅取 note），返回 None 表示不提前结束。
+
+    messages 原地累积（不返回）；只读结果的 N² 安全取回（单次 ToolNode.invoke
+    后按 tool_call_id 建 map）只在此处维护。
+    """
+    if emit is None:
+        emit = lambda m: None
+    pending: list[dict] = []
+    iterations = 0
+    hit_cap = False
+    while iterations < max_iter:
+        iterations += 1
+        messages[:] = _sliding_compress(messages, head_len, request)
+        ai: AIMessage = _logged_invoke(_make_model(), messages, caller)
+        messages.append(ai)
+        emit(ai)
+        if not ai.tool_calls:
+            break
+        # 只读工具结果：单次 ToolNode.invoke 执行本 AI 消息的全部只读调用，再按
+        # tool_call_id 取回——此前在循环里每个 tc 都 invoke 一次，而 ToolNode 每次
+        # 都执行 AI 消息里的全部调用，N 个并行调用产生 N² 条重复 ToolMessage（同
+        # tool_call_id 重复），被网关按非法请求 400 拒掉（glm 实测）。
+        ro_results: dict | None = None
+        for tc in ai.tool_calls:
+            name, args = tc.get("name"), tc.get("args") or {}
+            if name == FINAL_ANSWER_TOOL:
+                early = on_final_answer(args, pending)
+                if early is not None:
+                    return early
+                continue
+            if name in PLAN_TOOL_NAMES:
+                # 与 worker 一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
+                blocked = _precheck_plan_tool(name, args)
+                if blocked:
+                    tool_msg = ToolMessage(
+                        content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"])
+                else:
+                    pending.append({"action": name, **args})
+                    # 只回摘要，不把完整 content/大段 args 再塞进上下文
+                    summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
+                    if "content" in args:
+                        summary["content_len"] = len(args["content"])
+                    if "old" in args:
+                        summary["old_len"] = len(args["old"])
+                    if "new" in args:
+                        summary["new_len"] = len(args["new"])
+                    if "code" in args:
+                        summary["code_len"] = len(args["code"])
+                    tool_msg = ToolMessage(
+                        content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
+                        tool_call_id=tc["id"],
+                    )
+                messages.append(tool_msg)
+                emit(tool_msg)
+            else:
+                if ro_results is None:
+                    tms = tool_node.invoke(messages)
+                    tms = tms if isinstance(tms, list) else tms.get("messages", [])
+                    ro_results = {tm.tool_call_id: tm for tm in tms}
+                tool_msg = ro_results.get(tc["id"])
+                if tool_msg is not None:
+                    messages.append(tool_msg)
+                    emit(tool_msg)
+        # 计划步只在一批改动攒出（即将进入审批）时推进
+        if pending:
+            break
+    else:
+        hit_cap = True
+    return finalize(pending, hit_cap)
+
+
 def agent(state: AgentState) -> dict:
     tip = f"计划：{json.dumps(state['plan'], ensure_ascii=False)}；当前第 {state['current_step'] + 1}/{len(state['plan'])} 步。"
     if state.get("verdict") in ("revise", "rejected") and state.get("feedback"):
@@ -423,81 +508,38 @@ def agent(state: AgentState) -> dict:
     updated: list = []
     # delta 语义：pending_changes 有 _resettable_add reducer，这里只收集本轮新增，
     # reducer 负责追加到 state；若从 state 复制再返回全量会导致重复累加。
-    pending: list[dict] = []
     step = state.get("current_step", 0)
-    iterations = 0
 
-    while iterations < MAX_TOOL_ITERATIONS:
-        iterations += 1
-        messages = _sliding_compress(messages, head_len, state["request"])
-        ai: AIMessage = _logged_invoke(_make_model(), messages, "agent")
-        messages.append(ai)
-        updated.append(ai)
-        if not ai.tool_calls:
-            break
-        # 只读工具结果（本 AI 消息）：ToolNode 一次执行全部只读调用后按
-        # tool_call_id 取回——此前在循环里每个 tc 都 invoke 一次，而 ToolNode
-        # 每次都执行 AI 消息里的全部调用，N 个并行调用产生 N² 条 ToolMessage
-        # （同一 tool_call_id 重复），被网关按非法请求 400 拒掉（glm 实测）
-        ro_results: dict | None = None
-        for tc in ai.tool_calls:
-            name, args = tc.get("name"), tc.get("args") or {}
-            if name == FINAL_ANSWER_TOOL:
-                # 显式终止：只读工具，直接执行并把 answer 作为最终答复
-                tool_messages = tool_node.invoke(messages)
-                tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
-                for tm in tool_messages:
-                    messages.append(tm)
-                    updated.append(tm)
-                # 把 final_answer 内容提炼成一条 AIMessage，作为本轮收尾
-                answer_text = args.get("answer", "")
-                updated.append(AIMessage(content=answer_text))
-                return {"messages": updated, "pending_changes": pending, "current_step": step}
-            if name in PLAN_TOOL_NAMES:
-                blocked = _precheck_plan_tool(name, args)
-                if blocked:
-                    tool_msg = ToolMessage(
-                        content=f"被拦截：{blocked} 请修正后重试。",
-                        tool_call_id=tc["id"],
-                    )
-                else:
-                    pending.append({"action": name, **args})
-                    # 只回摘要，不把完整 content/大段 args 再塞进上下文
-                    summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
-                    if "content" in args:
-                        summary["content_len"] = len(args["content"])
-                    if "old" in args:
-                        summary["old_len"] = len(args["old"])
-                    if "new" in args:
-                        summary["new_len"] = len(args["new"])
-                    if "code" in args:
-                        summary["code_len"] = len(args["code"])
-                    tool_msg = ToolMessage(
-                        content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
-                        tool_call_id=tc["id"],
-                    )
-                messages.append(tool_msg)
-                updated.append(tool_msg)
-            else:
-                if ro_results is None:
-                    tms = tool_node.invoke(messages)
-                    tms = tms if isinstance(tms, list) else tms.get("messages", [])
-                    ro_results = {tm.tool_call_id: tm for tm in tms}
-                tool_msg = ro_results.get(tc["id"])
-                if tool_msg is not None:
-                    messages.append(tool_msg)
-                    updated.append(tool_msg)
-        # 计划步只在一批改动攒出（即将进入审批）时推进：
+    def _emit(msg) -> None:
+        updated.append(msg)
+
+    def _on_final_answer(args, pending) -> dict:
+        # 显式终止：只读工具，直接执行并把 answer 作为最终答复
+        tool_messages = tool_node.invoke(messages)
+        tool_messages = tool_messages if isinstance(tool_messages, list) else tool_messages.get("messages", [])
+        for tm in tool_messages:
+            messages.append(tm)
+            updated.append(tm)
+        # 把 final_answer 内容提炼成一条 AIMessage，作为本轮收尾
+        updated.append(AIMessage(content=args.get("answer", "")))
+        return {"messages": updated, "pending_changes": pending, "current_step": step}
+
+    def _finalize(pending, hit_cap) -> dict:
+        # 计划步只在一批改动攒出（即将进入审批）时推进一次：
         # 此前每次工具迭代都自增，step 语义实际是「迭代计数」，
         # 与 tip 里「当前第 N/M 步」的计划步含义不符
         if pending:
+            nonlocal step
             step = min(step + 1, max(len(state.get("plan", [])) or 1, 1))
-            break
-    else:
-        # 达到工具迭代上限，强制结束并提示
-        updated.append(AIMessage(content=f"（已达工具迭代上限 {MAX_TOOL_ITERATIONS}，强制收尾）"))
+        if hit_cap:
+            # 达到工具迭代上限，强制结束并提示
+            updated.append(AIMessage(content=f"（已达工具迭代上限 {MAX_TOOL_ITERATIONS}，强制收尾）"))
+        return {"messages": updated, "pending_changes": pending, "current_step": step}
 
-    return {"messages": updated, "pending_changes": pending, "current_step": step}
+    return _tool_loop_core(
+        messages, max_iter=MAX_TOOL_ITERATIONS, head_len=head_len,
+        request=state["request"], emit=_emit, finalize=_finalize,
+        on_final_answer=_on_final_answer, caller="agent")
 
 
 def _worker_result(subtask: str, note: str, pending: list[dict]) -> dict:
@@ -525,46 +567,22 @@ def worker(state: AgentState) -> dict:
             SystemMessage(content=WORKER_PROMPT),
             HumanMessage(content=f"总需求：{state['request']}\n你负责的子任务：{subtask}"),
         ]
-        pending: list[dict] = []
 
-        for _ in range(MAX_WORKER_ITERATIONS):
-            messages = _sliding_compress(messages, 2, state["request"])
-            ai: AIMessage = _logged_invoke(_make_model(), messages, "worker")
-            messages.append(ai)
-            if not ai.tool_calls:
-                break
-            # 只读工具结果按 tool_call_id 取回（N² 重复修复，同 agent 节点）
-            ro_results: dict | None = None
-            for tc in ai.tool_calls:
-                name, args = tc.get("name"), tc.get("args") or {}
-                if name == FINAL_ANSWER_TOOL:
-                    # 拿到总结即返回，不再 invoke，无需补 ToolMessage
-                    note = args.get("answer", "") or "完成"
-                    return _worker_result(subtask, note, pending)
-                if name in PLAN_TOOL_NAMES:
-                    # 与 agent 节点一致的双路径安全校验（agent 直接搬 args，绕过 @tool 内检查）
-                    blocked = _precheck_plan_tool(name, args)
-                    if blocked:
-                        messages.append(ToolMessage(
-                            content=f"被拦截：{blocked} 请修正后重试。", tool_call_id=tc["id"]))
-                        continue
-                    pending.append({"action": name, **args})
-                    summary = {k: v for k, v in args.items() if k in ("path", "command", "cwd")}
-                    messages.append(ToolMessage(
-                        content=f"已暂存待审批：{name}({json.dumps(summary, ensure_ascii=False)})",
-                        tool_call_id=tc["id"]))
-                else:
-                    if ro_results is None:
-                        tms = tool_node.invoke(messages)
-                        tms = tms if isinstance(tms, list) else tms.get("messages", [])
-                        ro_results = {tm.tool_call_id: tm for tm in tms}
-                    tool_msg = ro_results.get(tc["id"])
-                    if tool_msg is not None:
-                        messages.append(tool_msg)
-            if pending:
-                break
-        note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
-        return _worker_result(subtask, note, pending)
+        def _on_final_answer(args, pending) -> dict:
+            # 拿到总结即返回，不再 invoke，无需补 ToolMessage
+            note = args.get("answer", "") or "完成"
+            return _worker_result(subtask, note, pending)
+
+        def _finalize(pending, hit_cap) -> dict:
+            note = f"暂存 {len(pending)} 处改动" if pending else "未产生改动"
+            return _worker_result(subtask, note, pending)
+
+        # emit=None：worker 不把消息登记进 state 增量（并行分支消息会交错混乱，
+        # 仅内部 messages 累积，产出经 _resettable_add reducer 聚合）
+        return _tool_loop_core(
+            messages, max_iter=MAX_WORKER_ITERATIONS, head_len=2,
+            request=state["request"], emit=None, finalize=_finalize,
+            on_final_answer=_on_final_answer, caller="worker")
     except Exception as exc:  # noqa: BLE001 — 并行 worker 单点失败不应拖垮整图
         return _worker_result(subtask, f"子任务失败：{type(exc).__name__}: {exc}", [])
 
@@ -952,15 +970,30 @@ def route_after_planner(state: AgentState):
     return "agent"
 
 
-def _ensure_blue_dir() -> None:
-    os.makedirs(BLUE_DIR, exist_ok=True)
+# ── 以下定义已迁至子模块（#7 模块拆分）──
+#   Session / _ensure_blue_dir / _get_conn / _save_session_meta / list_sessions / 目录常量 → session.py
+#   SLASH_HELP / handle_slash / 渲染与交互 / step 回调机制 → cli.py
+#   经文件末尾显式重导出，agent.X 仍可访问（patch("agent.X") 亦生效，validate_graph.py 依赖）。
+#
+#   注意：step 回调的注册表 _step_callbacks 只在 cli.py 一份（register/clear/_emit_step
+#   全由 cli 提供）；agent 的 _drain/_run_graph_core/run_round_auto 调用的 _emit_step
+#   即 cli 那份，回调注册（register_step_callback(_print_node)）与触发天然同一份列表。
 
 
-def _get_conn() -> sqlite3.Connection:
-    _ensure_blue_dir()
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+# ─────────────────────────── 主交互循环 ───────────────────────────
+
+
+def _round_cost_str(usage: dict) -> str:
+    """按单价配置算本轮成本串；未配置或配置非法返回空串（不影响播报）。"""
+    try:
+        pi = float(os.environ.get("PRICE_PER_1M_INPUT", "") or 0)
+        po = float(os.environ.get("PRICE_PER_1M_OUTPUT", "") or 0)
+    except ValueError:
+        return ""
+    if not (pi or po):
+        return ""
+    cost = usage["prompt"] * pi / 1e6 + usage["completion"] * po / 1e6
+    return f"｜≈ ${cost:.4f}"
 
 
 def build_graph(checkpointer=None):
@@ -990,422 +1023,25 @@ def build_graph(checkpointer=None):
 
 # ─────────────────────────── 会话管理 ───────────────────────────
 
-class Session:
-    """一次交互式会话：维护 thread_id 与轮次，支持多轮需求。"""
 
-    def __init__(self, thread_id: str | None = None):
-        self.thread_id = thread_id or f"blue-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        self.round = 0
-        self.created_at = datetime.now().isoformat(timespec="seconds")
-        # 会话级 token 累计（内存，不落库；重启清零）
-        self.token_usage = {"prompt": 0, "completion": 0, "calls": 0}
+def _safe_tid(thread_id: str) -> str | None:
+    """校验 thread_id 可安全用于拼备份路径；不安全返回 None（fail-closed）。
 
-    @property
-    def config(self) -> dict:
-        return {"configurable": {"thread_id": self.thread_id}}
+    当前 tid 均为 Session 内部生成（blue-<ts>-<hex>）、--resume 走序号选择，
+    无外部输入路径；此校验防未来外部来源（如可指定 tid 的入口）带 ../
+    或路径分隔符逃逸 BACKUP_ROOT。
 
-    def next_round(self) -> int:
-        self.round += 1
-        return self.round
-
-
-def _save_session_meta(sess: Session) -> None:
-    """把会话元信息写入 sqlite 辅助表，供 --resume 列表查询。"""
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                thread_id TEXT PRIMARY KEY,
-                created_at TEXT,
-                last_active TEXT,
-                rounds INTEGER
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO sessions (thread_id, created_at, last_active, rounds)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(thread_id) DO UPDATE SET
-                last_active = excluded.last_active,
-                rounds = excluded.rounds
-            """,
-            (sess.thread_id, sess.created_at, datetime.now().isoformat(timespec="seconds"), sess.round),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def list_sessions() -> list[dict]:
-    """从辅助表读历史会话列表。"""
-    if not os.path.exists(DB_PATH):
-        return []
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        rows = conn.execute(
-            "SELECT thread_id, created_at, last_active, rounds FROM sessions ORDER BY last_active DESC"
-        ).fetchall()
-        return [
-            {"thread_id": r[0], "created_at": r[1], "last_active": r[2], "rounds": r[3]}
-            for r in rows
-        ]
-    except sqlite3.OperationalError:
-        return []
-    finally:
-        conn.close()
-
-
-# ─────────────────────────── 斜杠命令 ───────────────────────────
-
-SLASH_HELP = """可用斜杠命令：
-  /help          显示本帮助
-  /quit, /exit   退出当前会话
-  /clear         清空当前会话的上下文（开启新 thread）
-  /history       查看本会话已完成的轮次与状态摘要
-  /graph         打印图拓扑
-  /resume        列出历史会话并恢复（等价于启动时 --resume）
-  /new           强制开启新 thread（保留旧 checkpoint）
-  /undo          回退最近一次审批通过的文件改动（命令/Python 副作用不可撤）
-  /retry         从断点续跑上一轮未完成的执行（异常中断/审批点均可续）
-"""
-
-
-def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
-    """处理斜杠命令。返回 (should_continue, new_session_or_none)。
-    should_continue=False 表示退出主循环。
+    用 Path.resolve + relative_to 校验：解析后的路径必须仍落在 BACKUP_ROOT
+    内，既拦 ../ 也拦绝对路径等任何越界写法（比单纯字符过滤更强）。
     """
-    cmd = cmd.strip().lower()
-    if cmd in ("/quit", "/exit"):
-        print("[蓝] 👋 再见！")
-        return False, None
-    if cmd == "/help":
-        print(SLASH_HELP)
-        return True, None
-    if cmd == "/clear":
-        new_sess = Session()
-        print(f"[蓝] 🧹 已开启新 thread：{new_sess.thread_id}")
-        return True, new_sess
-    if cmd == "/new":
-        new_sess = Session()
-        print(f"[蓝] 🆕 新 thread：{new_sess.thread_id}")
-        return True, new_sess
-    if cmd == "/history":
-        cur = graph.get_state(sess.config)
-        vals = cur.values if cur else {}
-        print(f"[蓝] 当前 thread：{sess.thread_id}")
-        print(f"     已进行 {sess.round} 轮需求")
-        if sess.token_usage["calls"]:
-            t = sess.token_usage
-            print(f"     token 累计：{t['prompt']} + {t['completion']} = {t['prompt'] + t['completion']}（{t['calls']} 次调用）")
-        print(f"     图状态：next={list(cur.next) if cur and cur.next else '（已完成）'}")
-        if vals.get("plan"):
-            print(f"     最近计划：{json.dumps(vals['plan'], ensure_ascii=False)}")
-        if vals.get("review_rounds"):
-            print(f"     评审轮数：{vals['review_rounds']}")
-        return True, None
-    if cmd == "/graph":
-        print(graph.get_graph().draw_ascii())
-        return True, None
-    if cmd == "/undo":
-        print(_c(f"[蓝] ↩ {_undo_latest(sess.thread_id)}", _C.YELLOW))
-        return True, None
-    if cmd == "/retry":
-        if not resume_pending(graph, sess):
-            print("[蓝] 没有可续的断点（上一轮已正常结束）。")
-        return True, None
-    if cmd == "/resume":
-        sessions = list_sessions()
-        if not sessions:
-            print("[蓝] 暂无历史会话。")
-            return True, None
-        print("[蓝] 历史会话（最近在前）：")
-        for i, s in enumerate(sessions[:10], 1):
-            marker = " 👈 当前" if s["thread_id"] == sess.thread_id else ""
-            print(f"  {i}. {s['thread_id']}  轮次={s['rounds']}  最后活动={s['last_active']}{marker}")
-        choice = input("输入序号恢复，或回车取消 > ").strip()
-        if not choice:
-            return True, None
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(sessions):
-                new_sess = Session(thread_id=sessions[idx]["thread_id"])
-                new_sess.round = sessions[idx]["rounds"]
-                print(f"[蓝] 🔁 已恢复 thread：{new_sess.thread_id}")
-                return True, new_sess
-            print("[蓝] 序号无效。")
-        except ValueError:
-            print("[蓝] 请输入数字。")
-        return True, None
-    print(f"[蓝] 未知命令 {cmd}，输入 /help 查看可用命令。")
-    return True, None
-
-
-# ─────────────────────────── 主交互循环 ───────────────────────────
-
-
-# ─────────────────────────── step 回调注册机制（借鉴 smolagents step_callbacks） ───────────────────────────
-# 节点输出通过回调链处理，默认回调是 CLI 打印。
-# 外部（TUI/Web UI/测试）可注册自己的回调，无需修改核心逻辑。
-# 回调签名：fn(node_name: str, output: dict) -> None
-
-from collections.abc import Callable
-
-_step_callbacks: list[Callable[[str, dict], None]] = []
-
-
-def register_step_callback(fn: Callable[[str, dict], None]) -> None:
-    """注册一个节点输出回调。按注册顺序依次调用。"""
-    _step_callbacks.append(fn)
-
-
-def clear_step_callbacks() -> None:
-    """清空所有回调（测试用）。"""
-    _step_callbacks.clear()
-
-
-def _emit_step(node_name: str, output: dict) -> None:
-    for fn in _step_callbacks:
-        try:
-            fn(node_name, output)
-        except Exception:  # noqa: BLE001 — 回调异常不阻断主流程
-            pass
-
-
-def _summarize_output(output: dict) -> str:
-    """节点输出压缩成单行摘要，供节点文件日志。"""
-    parts: list[str] = []
-    if output.get("verdict"):
-        parts.append(f"verdict={output['verdict']}")
-    if output.get("pending_changes"):
-        actions = ",".join(c.get("action", "?") for c in output["pending_changes"])
-        parts.append(f"pending={len(output['pending_changes'])}({actions})")
-    if output.get("parallel_tasks"):
-        parts.append(f"parallel={len(output['parallel_tasks'])}")
-    if output.get("worker_notes"):
-        parts.append(f"notes={len(output['worker_notes'])}")
-    if "review_rounds" in output:
-        parts.append(f"rounds={output['review_rounds']}")
-    if output.get("feedback"):
-        fb = str(output["feedback"]).replace("\n", " ")[:200]
-        parts.append(f"feedback={fb!r}")
-    return " ".join(parts) or "(empty)"
-
-
-def _file_log_callback(node_name: str, output: dict) -> None:
-    """step 回调：节点输出写文件日志（CLI 启动时挂载）。"""
-    _node_logger().info("[%s] %s", node_name, _summarize_output(output))
-
-
-def _setup_file_logging() -> None:
-    """CLI 入口调用：注册节点文件日志回调。测试不调 main()，不写文件。"""
-    register_step_callback(_file_log_callback)
-
-
-# ─────────────────────────── 终端颜色（ANSI，无依赖） ───────────────────────────
-# 仅交互 TTY 启用：管道/重定向（benchmark 子进程 capture_output、results/*.log）自动无色。
-# 尊重 NO_COLOR 惯例（https://no-color.org/）：设置即禁用。
-
-_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-
-
-class _C:
-    """ANSI 颜色码；无颜色环境全部是空串。"""
-    BLUE = "\033[94m" if _USE_COLOR else ""        # [蓝] 普通播报
-    CYAN = "\033[36m" if _USE_COLOR else ""        # worker / 次级播报
-    GREEN = "\033[32m" if _USE_COLOR else ""       # 放行 / 成功
-    YELLOW = "\033[33m" if _USE_COLOR else ""      # 待审批 / 打回（需要用户注意）
-    RED = "\033[31m" if _USE_COLOR else ""         # 错误
-    BRIGHT_CYAN = "\033[96m" if _USE_COLOR else ""  # 用户输入提示符 / 交付报告
-    DIM = "\033[2m" if _USE_COLOR else ""          # 自动模式播报
-    RESET = "\033[0m" if _USE_COLOR else ""
-
-
-def _c(text: str, color: str) -> str:
-    """着色；无颜色环境原样返回。"""
-    return f"{color}{text}{_C.RESET}" if _USE_COLOR else text
-
-
-# input() 提示符着色：GNU readline / libedit 需要 \001\002 包围不可见字符，
-# 否则长输入换行时光标位置算错。无 readline 的环境裸用 ANSI 即可。
-try:
-    import readline as _readline  # noqa: F401 — 顺带启用行编辑/历史（易用性）
-    _P1, _P2 = "\001", "\002"
-except ImportError:
-    _P1, _P2 = "", ""
-
-
-def _prompt(text: str, color: str) -> str:
-    """input() 用的着色提示符（readline 安全）。"""
-    return f"{_P1}{color}{_P2}{text}{_P1}{_C.RESET}{_P2}" if _USE_COLOR else text
-
-
-def _shown_change(c: dict) -> dict:
-    """改动摘要：大字段（content/old/new/code）替换为长度，防长内容刷爆终端。
-    _print_pending 播报与 run_round 审批展示共用。"""
-    shown = {k: v for k, v in c.items() if k != "action"}
-    for big in ("content", "old", "new", "code"):
-        if big in shown:
-            shown[f"{big}_len"] = len(shown.pop(big))
-    return shown
-
-
-def _preview_lines(text: str, n: int = 5) -> str:
-    """长文本预览：前 n 行 + 总行数提示（审批场景：看得见概要，不被刷屏）。"""
-    lines = text.split("\n")
-    if len(lines) <= n:
-        return text
-    return "\n".join(lines[:n]) + f"\n  …（共 {len(lines)} 行，按 d 查看全文）"
-
-
-def _print_change_approval(ci: int, ch: dict) -> None:
-    """审批列表的单条改动：给内容预览而非只有长度——审批是安全底线，
-    只看 content_len=N 就按 y 等于闭眼放行。"""
-    action = ch["action"]
-    if action == "plan_run_command":
-        # 命令本来就不长，完整显示
-        print(_c(f"  {ci}. [{action}] {ch.get('command', '')}", _C.YELLOW))
-        return
-    print(_c(f"  {ci}. [{action}] {ch.get('path', '')}", _C.YELLOW))
-    if action == "plan_patch":
-        print(_c(f"     --- old\n{_preview_lines(ch.get('old', ''), 3)}", _C.DIM))
-        print(_c(f"     +++ new\n{_preview_lines(ch.get('new', ''), 3)}", _C.DIM))
-    elif action == "plan_write_file":
-        print(_c(_preview_lines(ch.get("content", "")), _C.DIM))
-    elif action == "plan_run_python":
-        print(_c(_preview_lines(ch.get("code", ""), 10), _C.DIM))
-
-
-def _print_changes_full(changes: list[dict]) -> None:
-    """[d] 详情：完整打印每条改动的全部内容（用户主动要求，不再截断）。
-    rich 可用时升级渲染：patch 红绿 unified diff、写文件/代码语法高亮（超 100 行分页）。"""
-    for ci, ch in enumerate(changes, 1):
-        print(_c(f"── 改动 {ci} [{ch['action']}] {'─' * 30}", _C.YELLOW))
-        if _RICH_CONSOLE is not None and _print_change_rich(ch):
-            print()
-            continue
-        for k, v in ch.items():
-            if k != "action":
-                print(f"{k}: {v}")
-        print()
-
-
-try:  # rich 是软依赖：缺失时 fallback 纯文本，不影响主流程
-    from rich.console import Console
-    from rich.syntax import Syntax
-    from rich.text import Text
-    _RICH_CONSOLE: "Console | None" = Console()
-except ImportError:
-    _RICH_CONSOLE = None
-
-
-def _lex_for_path(path: str) -> str:
-    """按文件扩展名猜 pygments lexer（语法高亮用）。"""
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    return {
-        "py": "python", "js": "javascript", "ts": "typescript", "css": "css",
-        "html": "html", "json": "json", "md": "markdown", "sh": "bash",
-        "toml": "toml", "yaml": "yaml", "yml": "yaml",
-    }.get(ext, "text")
-
-
-def _print_change_rich(ch: dict) -> bool:
-    """用 rich 渲染单条改动详情。返回是否已渲染（False 时调用方 fallback 纯文本）。"""
-    console = _RICH_CONSOLE
-    action = ch["action"]
-    if action == "plan_patch":
-        import difflib
-        old_lines = str(ch.get("old", "")).splitlines(keepends=True)
-        new_lines = str(ch.get("new", "")).splitlines(keepends=True)
-        diff = difflib.unified_diff(old_lines, new_lines, fromfile="old", tofile="new")
-        text = Text()
-        for line in diff:
-            line = line.rstrip("\n")
-            if line.startswith("+") and not line.startswith("+++"):
-                text.append(line + "\n", style="green")
-            elif line.startswith("-") and not line.startswith("---"):
-                text.append(line + "\n", style="red")
-            elif line.startswith("@@"):
-                text.append(line + "\n", style="cyan")
-            else:
-                text.append(line + "\n")
-        console.print(f"path: {ch.get('path', '')}")
-        console.print(text)
-        return True
-    if action in ("plan_write_file", "plan_run_python"):
-        code = ch.get("content") if action == "plan_write_file" else ch.get("code")
-        lexer = _lex_for_path(ch.get("path", "")) if action == "plan_write_file" else "python"
-        syntax = Syntax(str(code), lexer, line_numbers=True, word_wrap=True)
-        if ch.get("path"):
-            console.print(f"path: {ch['path']}")
-        if str(code).count("\n") + 1 > 100:
-            with console.pager():  # 超 100 行分页（非 tty 时 rich 直接顺序输出，安全）
-                console.print(syntax)
-        else:
-            console.print(syntax)
-        return True
-    return False
-
-
-def _print_pending(prefix: str, changes: list[dict]) -> None:
-    """打印暂存的改动清单（agent 与 worker 共用）。"""
-    for c in changes:
-        print(f"{prefix} 已暂存待审批 → {c['action']}({json.dumps(_shown_change(c), ensure_ascii=False)})")
-
-
-def _print_node(node_name: str, output: dict) -> None:
-    if node_name == "planner":
-        plan = output.get("plan", [])
-        parallel = output.get("parallel_tasks") or []
-        if len(parallel) >= 2:
-            print(_c(f"[蓝] 拆出 {len(parallel)} 个独立子任务，并行 worker 处理：{json.dumps(parallel, ensure_ascii=False)}", _C.BLUE))
-        # planner 条件化：单步且与需求原文一致 → 简单需求直接执行
-        elif len(plan) == 1:
-            print(_c("[蓝] 简单需求，直接执行", _C.BLUE))
-        else:
-            print(_c(f"[蓝] 计划：{json.dumps(plan, ensure_ascii=False)}", _C.BLUE))
-    elif node_name == "agent" and output.get("pending_changes"):
-        _print_pending(_c("[蓝]", _C.BLUE), output["pending_changes"])
-    elif node_name == "worker":
-        _print_pending(_c("[蓝·worker]", _C.CYAN), output.get("pending_changes", []))
-        for note in output.get("worker_notes", []):
-            print(_c(f"[蓝·worker] {note}", _C.CYAN))
-    elif node_name == "guard":
-        print(_c(f"[蓝] 审批结果：{output.get('verdict')}", _C.BLUE))
-    elif node_name == "verifier":
-        fb = output.get("feedback", "")
-        if "【自动验证结果】" in fb:
-            # 只打印验证部分，不重复执行结果；✗ 红 ✓ 绿，扫一眼即知
-            verify_part = fb.split("【自动验证结果】")[-1].strip()
-            colored = [
-                _c(ln, _C.RED) if "✗" in ln else _c(ln, _C.GREEN) if "✓" in ln else ln
-                for ln in verify_part.split("\n")
-            ]
-            print(_c("[蓝] 🔍 自动验证：", _C.BLUE) + "\n".join(colored))
-    elif node_name == "reviewer":
-        passed = output.get("verdict") == "pass"
-        mark = "✅ 放行" if passed else "🔪 打回"
-        print(_c(f"[评审] {mark}｜{output.get('feedback', '')}", _C.GREEN if passed else _C.YELLOW))
-    elif node_name == "report":
-        print(_c(f"\n[蓝] {output.get('feedback', '')}", _C.BRIGHT_CYAN))
-
-
-def _round_cost_str(usage: dict) -> str:
-    """按单价配置算本轮成本串；未配置或配置非法返回空串（不影响播报）。"""
+    tid = thread_id or "unknown"
     try:
-        pi = float(os.environ.get("PRICE_PER_1M_INPUT", "") or 0)
-        po = float(os.environ.get("PRICE_PER_1M_OUTPUT", "") or 0)
-    except ValueError:
-        return ""
-    if not (pi or po):
-        return ""
-    cost = usage["prompt"] * pi / 1e6 + usage["completion"] * po / 1e6
-    return f"｜≈ ${cost:.4f}"
-
-
-AUDIT_LOG = os.path.join(BLUE_DIR, "audit.jsonl")
-BACKUP_ROOT = os.path.join(BLUE_DIR, "backups")
+        root = Path(BACKUP_ROOT).resolve()
+        resolved = (root / tid).resolve()
+        resolved.relative_to(root)  # 越界（含 ../、绝对路径）抛 ValueError
+    except (ValueError, OSError):
+        return None
+    return tid
 
 
 def _snapshot_files(files: list[str], thread_id: str, request: str) -> str | None:
@@ -1418,8 +1054,11 @@ def _snapshot_files(files: list[str], thread_id: str, request: str) -> str | Non
     files = [f for f in files if f]
     if not files:
         return None
+    tid = _safe_tid(thread_id)
+    if tid is None:
+        print(_c(f"[蓝] ⚠ thread_id 含非法字符（{thread_id!r}），跳过快照——本轮改动不可 /undo。", _C.RED))
+        return None
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    tid = thread_id or "unknown"
     snap_dir = os.path.join(BACKUP_ROOT, tid, ts)
     saved, new_files = [], []
     for rel in files:
@@ -1446,7 +1085,10 @@ def _snapshot_files(files: list[str], thread_id: str, request: str) -> str | Non
 
 def _undo_latest(thread_id: str) -> str:
     """恢复最近一次快照（单轮 latest 指针）。返回人可读的恢复报告。"""
-    tdir = os.path.join(BACKUP_ROOT, thread_id or "unknown")
+    tid = _safe_tid(thread_id)
+    if tid is None:
+        return f"thread_id 含非法字符（{thread_id!r}），拒绝回退。"
+    tdir = os.path.join(BACKUP_ROOT, tid)
     latest_file = os.path.join(tdir, "latest")
     if not os.path.isfile(latest_file):
         return "没有可回退的快照（审批通过文件改动时会自动备份）。"
@@ -1593,6 +1235,12 @@ def resume_pending(graph, sess: Session) -> bool:
 
     at-least-once 语义（已接受）：guard 节点内无中间 checkpoint，崩溃续跑会重进
     guard，已执行的改动可能再执行一次——靠执行顺序（幂等的写文件先跑）+ 审计日志兜底。
+
+    熔断（RESUME_STREAM_TIMEOUT）：续跑若在同一节点反复失败（如 planner 持续抛错、
+    API 长时间 5xx），graph.stream(None) 可能无进展地重入该节点甚至**永不返回**
+    （实测：节点崩溃后续跑，LangGraph 从 checkpoint 反复重驱失败任务、既不抛异常
+    也不推进，单次 stream 调用卡死数小时占满 CPU）。故单次续跑套墙钟超时，超时即
+    熔断返回、绝不忙等；正常续跑停在 guard interrupt 后交给 _drain 审批。
     """
     cur = graph.get_state(sess.config)
     if not cur or not cur.next:
@@ -1603,21 +1251,59 @@ def resume_pending(graph, sess: Session) -> bool:
     if "guard" in cur.next and not any(t.interrupts for t in cur.tasks):
         print(_c("[蓝] ⚠ 上次执行可能已部分完成，重复执行的改动以审计日志为准。", _C.YELLOW))
     print(_c(f"[蓝] 🔁 从断点继续（待执行节点：{list(cur.next)}）…", _C.BLUE))
-    try:
-        for chunk in graph.stream(None, config=sess.config, stream_mode="updates"):
-            for node_name, output in chunk.items():
-                _emit_step(node_name, output)
-    except Exception:
-        traceback.print_exc()
-        _node_logger().exception("resume_pending 续跑异常（thread=%s）", sess.thread_id)
+
+    # 单次 stream 续跑 + 熔断超时：正常续跑会停在 guard interrupt（等 _drain 审批），
+    # 所以**不能**用「失败重试」循环——在 interrupt 上重复 stream(None) 会挂死。
+    # 这里只在「单次 stream 超时不返回」时熔断：节点崩溃后续跑，LangGraph 可能从
+    # checkpoint 反复重驱失败任务而永不返回（实测占满 CPU 数小时），信号无法打断，
+    # 只能放后台线程跑 + join 超时检测。
+    box: dict = {}
+
+    def _run_stream():
+        chunks: list = []
+        err: list = []
+        try:
+            for chunk in graph.stream(None, config=sess.config, stream_mode="updates"):
+                for node_name, output in chunk.items():
+                    chunks.append((node_name, output))
+        except BaseException as e:
+            err.append(e)
+        box["chunks"], box["err"] = chunks, err
+
+    th = threading.Thread(target=_run_stream, daemon=True)
+    th.start()
+    th.join(timeout=RESUME_STREAM_TIMEOUT)
+    timed_out = th.is_alive()
+    if timed_out:
+        # 不强行杀线程（Python 无法安全强杀），直接熔断返回，让主线程释放；
+        # 残余线程随进程退出回收。用户可稍后重试 /retry。
+        print(_c(
+            f"[蓝] ⏱ 断点续跑 {RESUME_STREAM_TIMEOUT:.0f}s 无进展，已熔断停止（避免忙等占满 CPU）。"
+            f"可稍后重试 /retry，或检查 API/网络后重跑。",
+            _C.RED,
+        ))
+        _node_logger().warning("resume_pending 续跑超时熔断（thread=%s）", sess.thread_id)
+    else:
+        for node_name, output in box.get("chunks", []):
+            _emit_step(node_name, output)
+        err = box.get("err", [])
+        if err:
+            traceback.print_exception(type(err[0]), err[0], err[0].__traceback__)
+            _node_logger().exception("resume_pending 续跑异常（thread=%s）", sess.thread_id)
     _drain(graph, sess.config, sess)
     _finish_round_usage(sess)
     _save_session_meta(sess)
     return True
 
 
-def run_round(graph, sess: Session, request: str) -> None:
-    """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
+def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain) -> None:
+    """run_round / run_round_auto 共享的一轮执行骨架（消除两处重复的前 10 行）。
+
+    持有：initial_state 组装 → thread_id → messages 注入需求（多轮连贯基础）
+    → token 重置 → 打印 → graph.stream（异常兜底）→ drain（审批策略注入）
+    → token 播报 → 会话元信息落库。差异仅审批环节：drain 回调封装不同审批
+    策略（人工 input / 自动 approve）。
+    """
     config = sess.config
     state = initial_state(request)
     state["thread_id"] = sess.thread_id
@@ -1625,65 +1311,24 @@ def run_round(graph, sess: Session, request: str) -> None:
     # 此前 request 从不进 messages，新一轮看不到上一轮问过什么，指代全断
     state["messages"] = [HumanMessage(content=request)]
     _reset_token_usage()
-    print(_c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE))
+    print(banner)
     try:
         for chunk in graph.stream(state, config=config, stream_mode="updates"):
             for node_name, output in chunk.items():
                 _emit_step(node_name, output)
     except Exception:
         traceback.print_exc()
-        _node_logger().exception("run_round 图执行异常（thread=%s）", sess.thread_id)
+        _node_logger().exception("图执行异常（thread=%s）", sess.thread_id)
         print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
-    _drain(graph, config, sess)
+    drain(graph, config, sess)
     _finish_round_usage(sess)
     _save_session_meta(sess)
 
 
-def run_interactive(graph, request: str | None = None, sess: Session | None = None) -> None:
-    """多轮交互主循环：支持连续提需求 + 斜杠命令。"""
-    register_step_callback(_print_node)  # 默认回调：CLI 打印
-    sess = sess or Session()
-    if request:
-        run_round(graph, sess, request)
-    print(_c("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
-    while True:
-        try:
-            line = input(_prompt("\n> ", _C.BRIGHT_CYAN)).strip()
-        except EOFError:
-            print(_c("\n[蓝] 👋 输入流关闭，退出。", _C.BLUE))
-            break
-        if not line:
-            continue
-        if line.startswith("/"):
-            cont, new_sess = handle_slash(line, sess, graph)
-            if not cont:
-                break
-            if new_sess is not None:
-                sess = new_sess
-            continue
-        run_round(graph, sess, line)
-
-
-def _resume_picker() -> str | None:
-    """启动时的 --resume 会话选择器。返回选中的 thread_id 或 None。"""
-    sessions = list_sessions()
-    if not sessions:
-        print("[蓝] 暂无历史会话可恢复。")
-        return None
-    print("[蓝] 历史会话（最近在前）：")
-    for i, s in enumerate(sessions[:10], 1):
-        print(f"  {i}. {s['thread_id']}  轮次={s['rounds']}  最后活动={s['last_active']}")
-    choice = input("输入序号恢复，或回车开启新会话 > ").strip()
-    if not choice:
-        return None
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(sessions):
-            return sessions[idx]["thread_id"]
-        print("[蓝] 序号无效，开启新会话。")
-    except ValueError:
-        print("[蓝] 输入无效，开启新会话。")
-    return None
+def run_round(graph, sess: Session, request: str) -> None:
+    """执行一轮需求：stream 图执行，处理 interrupt 审批。"""
+    banner = _c(f"[蓝] ★ 第 {sess.next_round()} 轮收到！开始干活。", _C.BLUE)
+    _run_graph_core(graph, sess, request, banner=banner, drain=_drain)
 
 
 # ─────────────────────────── blue init / doctor（v0.7 阶段二） ───────────────────────────
@@ -1691,162 +1336,8 @@ def _resume_picker() -> str | None:
 # doctor：环境/依赖/配置/API 可达/模型存在/tool calling 六项自检——「配错端点/模型
 # 裸 traceback」的实测坑（v1h typo、模型名不存在）都在启动时拦下。退出码 0/1，CI 可用。
 
-ENV_GLOBAL_PATH = os.path.join(BLUE_DIR, ".env")
 
-
-def _check_python() -> tuple[bool, str]:
-    v = sys.version_info
-    ok = v >= (3, 11)  # tomllib（.blue.toml 权限分级）需要 3.11+
-    return ok, f"Python {v.major}.{v.minor}.{v.micro}" + ("" if ok else "（需要 ≥3.11）")
-
-
-def _check_deps() -> list[tuple[bool, str]]:
-    out = []
-    for mod, required in (("langgraph", True), ("langchain_openai", True),
-                          ("langchain_core", True), ("dotenv", True),
-                          ("rich", False), ("grandalf", False)):
-        try:
-            __import__(mod)
-            out.append((True, f"{mod} 已安装"))
-        except ImportError:
-            out.append((not required,
-                        f"{mod} 缺失" + ("" if required else "（可选，缺失自动降级，不影响主流程）")))
-    return out
-
-
-def _check_config() -> tuple[bool, str]:
-    missing = [k for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL_NAME")
-               if not os.environ.get(k, "").strip()]
-    if missing:
-        return False, f"配置缺失：{', '.join(missing)}（跑 blue init，或检查 .env / ~/.blue/.env）"
-    return True, "三项配置齐全（OPENAI_API_KEY/OPENAI_BASE_URL/MODEL_NAME）"
-
-
-def _check_blue_dir() -> tuple[bool, str]:
-    try:
-        os.makedirs(BLUE_DIR, exist_ok=True)
-        probe = os.path.join(BLUE_DIR, ".write-test")
-        with open(probe, "w") as f:
-            f.write("ok")
-        os.remove(probe)
-        return True, f"{BLUE_DIR} 可写"
-    except OSError as exc:
-        return False, f"{BLUE_DIR} 不可写：{exc}"
-
-
-def _fetch_model_ids() -> list[str]:
-    """GET {base}/models 返回可用模型 id 列表；异常原样抛出，由调用方整形为诊断文本。"""
-    base = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
-    req = urllib.request.Request(
-        base + "/models",
-        headers={"Authorization": "Bearer " + os.environ.get("OPENAI_API_KEY", "").strip()})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-    return [m.get("id", "") for m in data.get("data", [])]
-
-
-def _check_api_and_model() -> tuple[bool, str]:
-    """API 可达 + key 有效 + MODEL_NAME 在可用列表（v1h typo / glm5.1 不存在的实测坑）。"""
-    model = os.environ.get("MODEL_NAME", "").strip()
-    try:
-        ids = _fetch_model_ids()
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            return False, f"API 可达但认证失败（HTTP {exc.code}）——OPENAI_API_KEY 无效"
-        return False, (f"模型列表请求失败（HTTP {exc.code}）——检查 OPENAI_BASE_URL 路径"
-                       f"（<base>/models 应可达；末尾多个字母之类 typo 会 404）")
-    except Exception as exc:
-        return False, f"API 不可达（{type(exc).__name__}: {exc}）——检查 OPENAI_BASE_URL / 网络"
-    if model in ids:
-        return True, f"API 可达，模型 {model} 在线（共 {len(ids)} 个可用）"
-    similar = [i for i in ids if model.split("-")[0].lower() in i.lower()]
-    hint = "、".join(similar[:5]) or "、".join(ids[:5])
-    return False, f"模型 {model} 不在可用列表，相近：{hint}"
-
-
-def _check_tool_calling() -> tuple[bool, str]:
-    """真实调一次最小 tool calling 请求（几个 token）：模型不支持工具调用则 agent 无法工作。"""
-    from langchain_core.tools import tool as _lc_tool
-
-    @_lc_tool
-    def _ping(x: str) -> str:
-        """自检探针。"""
-        return x
-
-    try:
-        resp = _make_plain_model().bind_tools([_ping]).invoke(
-            [HumanMessage(content='调用 _ping 工具，参数 x="ok"。')])
-    except Exception as exc:
-        return False, f"tool calling 探测失败（{type(exc).__name__}: {exc}）"
-    if getattr(resp, "tool_calls", None):
-        return True, "模型正确返回 tool_calls"
-    return False, "模型未返回 tool_calls（该模型可能不支持工具调用，agent 无法工作）"
-
-
-def cmd_doctor() -> int:
-    """自检：环境/依赖/配置/数据目录/API 与模型/tool calling。返回进程退出码（0=全过）。"""
-    checks: list[tuple[str, bool, str]] = [("Python 版本", *_check_python())]
-    checks += [("依赖", ok, msg) for ok, msg in _check_deps()]
-    checks.append(("配置", *_check_config()))
-    checks.append(("数据目录", *_check_blue_dir()))
-    config_ok = checks[-2][1]
-    if config_ok:  # 配置齐全才测 API，避免无 key 时的误导性报错
-        checks.append(("API 与模型", *_check_api_and_model()))
-        if checks[-1][1]:
-            checks.append(("tool calling", *_check_tool_calling()))
-    failed = 0
-    print("[蓝] 🩺 自检：")
-    for name, ok, msg in checks:
-        mark = _c("✓", _C.GREEN) if ok else _c("✗", _C.RED)
-        print(f"  {mark} {name}：{msg}")
-        failed += 0 if ok else 1
-    if failed:
-        print(_c(f"[蓝] {failed} 项未过，先修复再用。", _C.RED))
-        return 1
-    print(_c("[蓝] 全部通过，可以干活。", _C.GREEN))
-    return 0
-
-
-def _write_env_file(path: str, values: dict) -> None:
-    """写 .env（权限 600；已存在则先备份 <path>.bak）。空值键跳过。"""
-    if os.path.exists(path):
-        shutil.copy(path, path + ".bak")
-    lines = [f"{k}={v}" for k, v in values.items() if v]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# bluecode 配置（blue init 生成）\n" + "\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
-
-
-def cmd_init() -> int:
-    """交互式初始化：写全局 ~/.blue/.env（项目级 .env 可覆盖同名键），写完跑 doctor 验证。"""
-    print("[蓝] ⚙ 初始化配置（写入全局 ~/.blue/.env；项目根目录的 .env 可覆盖同名键；"
-          "显式环境变量优先级最高）")
-    if os.path.exists(ENV_GLOBAL_PATH):
-        print(f"[蓝] 已存在 {ENV_GLOBAL_PATH}，继续将覆盖（原文件备份为 .bak）。")
-        if input("继续？[y/N] > ").strip().lower() != "y":
-            print("[蓝] 已取消。")
-            return 1
-    cur = {k: os.environ.get(k, "").strip()
-           for k in ("OPENAI_BASE_URL", "MODEL_NAME", "OPENAI_API_KEY", "TAVILY_API_KEY")}
-    base = input(f"OPENAI_BASE_URL [{cur['OPENAI_BASE_URL'] or 'https://api.openai.com/v1'}] > ").strip() \
-        or cur["OPENAI_BASE_URL"] or "https://api.openai.com/v1"
-    model = input(f"MODEL_NAME [{cur['MODEL_NAME'] or 'gpt-4o-mini'}] > ").strip() \
-        or cur["MODEL_NAME"] or "gpt-4o-mini"
-    key_hint = "，回车保留已配置" if cur["OPENAI_API_KEY"] else ""
-    key = getpass.getpass(f"OPENAI_API_KEY（不回显{key_hint}）> ").strip() or cur["OPENAI_API_KEY"]
-    if not key:
-        print(_c("[蓝] ✗ OPENAI_API_KEY 必填。", _C.RED))
-        return 1
-    tavily = getpass.getpass("TAVILY_API_KEY（可选，web_search 用，回车跳过）> ").strip() \
-        or cur["TAVILY_API_KEY"]
-    _write_env_file(ENV_GLOBAL_PATH, {
-        "OPENAI_BASE_URL": base, "MODEL_NAME": model,
-        "OPENAI_API_KEY": key, "TAVILY_API_KEY": tavily,
-    })
-    print(f"[蓝] 已写入 {ENV_GLOBAL_PATH}（权限 600）。开始连通性自检…")
-    load_dotenv(ENV_GLOBAL_PATH, override=True)  # 让紧随的 doctor 读到新值
-    return cmd_doctor()
-
+# ── doctor/init 定义已迁至 doctor.py（见文件末尾 `from doctor import *`）──
 
 def main() -> None:
     # 子命令先行（v0.7 阶段二）：blue init 交互配配置 / blue doctor 自检
@@ -1895,38 +1386,46 @@ def main() -> None:
 
 def run_round_auto(graph, sess: Session, request: str) -> dict:
     """benchmark 模式：单轮执行，guard 自动 approve 不中断。返回 final state values（CI 退出码判断用）。"""
-    config = sess.config
-    state = initial_state(request)
-    state["thread_id"] = sess.thread_id
-    # 本轮需求写入 messages（add_messages 追加到历史尾部）——多轮连贯的基础：
-    # 此前 request 从不进 messages，新一轮看不到上一轮问过什么，指代全断
-    state["messages"] = [HumanMessage(content=request)]
-    _reset_token_usage()
-    print(_c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE))
-    try:
-        for chunk in graph.stream(state, config=config, stream_mode="updates"):
-            for node_name, output in chunk.items():
-                _emit_step(node_name, output)
-    except Exception:
-        traceback.print_exc()
-        _node_logger().exception("run_round_auto 图执行异常（thread=%s）", sess.thread_id)
 
-    # 自动审批所有 interrupt
-    while True:
-        cur = graph.get_state(config)
-        if not cur.next:
-            break
-        for task in cur.tasks:
-            if task.interrupts:
-                print(_c("[蓝] ⏸ 自动审批通过", _C.DIM))
-                _audit_log(sess.thread_id, {"action": "auto-approve"},
-                           task.interrupts[0].value.get("changes", []))
-                for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
-                    for node_name, output in chunk.items():
-                        _emit_step(node_name, output)
-    _finish_round_usage(sess)
-    _save_session_meta(sess)
+    def _auto_drain(graph, config, sess) -> None:
+        # 自动审批所有 interrupt（benchmark/CI 用；生产代码库勿无人值守跑）
+        while True:
+            cur = graph.get_state(config)
+            if not cur.next:
+                break
+            for task in cur.tasks:
+                if task.interrupts:
+                    print(_c("[蓝] ⏸ 自动审批通过", _C.DIM))
+                    _audit_log(sess.thread_id, {"action": "auto-approve"},
+                               task.interrupts[0].value.get("changes", []))
+                    for chunk in graph.stream(Command(resume={"action": "approve"}), config=config, stream_mode="updates"):
+                        for node_name, output in chunk.items():
+                            _emit_step(node_name, output)
+
+    banner = _c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE)
+    _run_graph_core(graph, sess, request, banner=banner, drain=_auto_drain)
     return graph.get_state(config).values
+
+
+# ─────────────────────────── #7 模块拆分：重导出（facade） ───────────────────────────
+# session / cli / doctor 的定义迁到子模块；此处显式重导出，使所有 `agent.X` 引用与
+# `patch("agent.X")` 继续生效（validate_graph.py 等依赖），零测试改动。
+# 注意：必须显式列出（含下划线前缀名），`from x import *` 不会引入 _ 前缀符号。
+from session import (  # noqa: E402,F401
+    BLUE_DIR, DB_PATH, AUDIT_LOG, BACKUP_ROOT, ENV_GLOBAL_PATH,
+    Session, _ensure_blue_dir, _get_conn, _save_session_meta, list_sessions,
+)
+from cli import (  # noqa: E402,F401
+    _C, _c, _prompt, SLASH_HELP, handle_slash, register_step_callback,
+    clear_step_callbacks, _emit_step, _summarize_output, _file_log_callback,
+    _setup_file_logging, _shown_change, _preview_lines, _print_change_approval,
+    _print_changes_full, _RICH_CONSOLE, _lex_for_path, _print_change_rich,
+    _print_pending, _print_node, run_interactive, _resume_picker,
+)
+from doctor import (  # noqa: E402,F401
+    _check_python, _check_deps, _check_config, _check_blue_dir, _fetch_model_ids,
+    _check_api_and_model, _check_tool_calling, cmd_doctor, _write_env_file, cmd_init,
+)
 
 
 if __name__ == "__main__":

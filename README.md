@@ -61,7 +61,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | `reviewer` | 自审：`verdict: pass / revise`，revise 弹回 agent 重改（上限 3 轮）；判定有 verifier 的客观验证结果做依据 |
 | `report` | 汇总改动清单 + 评审轮数 + 验证/执行结果，输出 Markdown 交付报告 |
 
-**安全模型**：工作目录沙箱（路径越界直接拒）+ 命令黑名单关键词拦截（含管道 `|`、复合命令 `&&`/`;`、命令替换 `$()`/反引号——防"第二段藏刀"）+ 可选命令白名单（`BLUE_COMMAND_WHITELIST`）+ 关键的最后一道人工审批。命令校验同时挂在「agent 暂存时」和「guard 审批执行前」两处（双路径）。
+**安全模型**：工作目录沙箱（路径越界直接拒）+ 命令黑名单关键词拦截（含管道 `|`、复合命令 `&&`/`;`、命令替换 `$()`/反引号——防"第二段藏刀"）+ 可选命令白名单（`BLUE_COMMAND_WHITELIST`）+ `.blue.toml` 权限分级（allow/ask/deny 三档，全局 `~/.blue/config.toml` + 项目级 `.blue.toml` 逐键合并）+ 关键的最后一道人工审批。命令校验同时挂在「agent 暂存时」和「guard 审批执行前」两处（双路径）。
 
 ## 状态设计
 
@@ -102,7 +102,7 @@ class AgentState(TypedDict):
 | `plan_write_file` | 完整覆盖写入 |
 | `plan_patch` | old→new 文本替换：默认要求唯一匹配（歧义即拒防误改）；多处时传 `occurrence=N` 指定替换第 N 处，比重写整个文件省 token |
 | `plan_run_command` | shell 命令（timeout 60s + 黑名单拦截 + 可选白名单） |
-| `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单——不含 subprocess，防绕过命令校验 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec，getattr/setattr 包装拦 dunder 字符串参数）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
+| `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单——不含 subprocess，防绕过命令校验 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec，getattr/setattr 包装拦 dunder 字符串参数）+ 受限 os 代理（只暴露 path/makedirs 等安全子集，system/popen/exec*/environ 一律拦截）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
 
 所有路径经 `_resolve()` 校验，越界即报错；工作目录固定为当前项目目录。
 
@@ -119,10 +119,14 @@ BLUE_COMMAND_WHITELIST=python3,pytest,ls,cat
 
 ```
 bluecode/
-├── agent.py            # 状态、节点、建图、CLI、step 回调机制（~950 行）
-├── tools.py            # 8 工具 + 安全校验（命令/Python 双路径）
+├── agent.py            # 状态、7 节点、建图、主循环（facade：重导出 session/cli/doctor，~1430 行）
+├── session.py          # Session 会话管理 + sessions 表 + 目录常量（#7 拆分）
+├── cli.py              # 斜杠命令、审批渲染、step 回调、交互主循环（#7 拆分）
+├── doctor.py           # blue init / blue doctor 自检（#7 拆分）
+├── tools.py            # 10 工具 + 安全校验（命令/Python 双路径 + .blue.toml 权限分级）
 ├── prompts.py          # planner / agent / worker / reviewer / report 提示词（文案集中）
-├── validate_graph.py   # 离线功能验证（fake model，10 项，不需 API key）
+├── pyproject.toml      # 打包配置（console_scripts：blue = agent:main）
+├── validate_graph.py   # 离线功能验证（fake model，32 项，不需 API key）
 ├── requirements.txt
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
@@ -139,11 +143,12 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 28 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 32 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
 # executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
-# LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 / web 搜索与抓取
+# LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 /
+# web 搜索与抓取 / doctor 自检判定 / init 写配置 / 并行只读调用去重 / _command_head 优先级
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -179,6 +184,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
 | v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
+| v0.7.x | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
@@ -187,7 +193,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 - **API key 只放在本地 `.env`（已被 .gitignore 排除）或环境变量**，绝不写进代码或已提交的文件。不要把 `.env` 同步到网盘/云存储。
 - `test2.py` 硬编码过一个真实 key，**该文件已被 `.gitignore` 排除，不进入版本库**；但它仍在你的本地磁盘上。建议尽快轮换该 key。
 - 危险命令拦截是启发式的，不是完备沙箱——**真正的安全门槛是 guard 人工审批**。`--auto-approve` 仅限 benchmark/CI 场景，不要在生产代码库上无人值守运行。
-- `plan_run_python` 的沙箱（ast 检查 + 受限 builtins）是纵深防御的一层，不是完备隔离——同样依赖审批兜底。
+- `plan_run_python` 的沙箱（ast 检查 + 受限 builtins + 受限 os 代理）是纵深防御的一层，不是完备隔离——同样依赖审批兜底。
 - 默认只读优先：模型被引导先读后写，写操作必须过审批。
 
 ## 已知限制
