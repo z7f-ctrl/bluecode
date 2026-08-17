@@ -1453,6 +1453,36 @@ def test_model_slash_command():
     print("PASS /model command（列表选择 + 直接切换 + 非法拒绝 + 无注册表提示）✔\n")
 
 
+def test_run_round_auto():
+    """回归：--auto-approve 路径自动审批、文件真落盘、返回最终 state。
+    曾用错误 config 取 state，--auto-approve 丢 interrupt 后数据。"""
+    scratch = os.path.abspath("scratch-auto-test.txt")
+    audit_path = os.path.join(_TMP_BACKUPS, "audit-auto.jsonl")
+    calls = [
+        AIMessage(content='["写 scratch 文件", "报告"]'),
+        AIMessage(content="写入文件", tool_calls=[
+            {"name": "plan_write_file", "args": {"path": scratch, "content": "auto ok"}, "id": "t1"}]),
+        AIMessage(content="verdict: pass\nfeedback: 写入正确。"),
+        AIMessage(content="# 报告\n完成。"),
+    ]
+    fake = FakeModel(calls)
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = agent.Session(thread_id="auto-test")
+    try:
+        with patch("agent.AUDIT_LOG", audit_path), \
+             patch("agent._make_model", lambda: fake), \
+             patch("agent._make_plain_model", lambda: fake), \
+             patch("agent.should_skip_planner", lambda r: False):
+            state = agent.run_round_auto(graph, sess, f"写入 {scratch}")
+        assert os.path.exists(scratch), "auto 审批后文件应真落盘"
+        assert state.get("verdict") == "pass", f"应为 pass，实际 {state.get('verdict')}"
+        assert state.get("pending_changes") == [], "审批后 pending 应为空"
+        print("PASS run_round_auto（自动审批 + 落盘 + 最终 state 返回）✔\n")
+    finally:
+        if os.path.exists(scratch):
+            os.unlink(scratch)
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1493,6 +1523,7 @@ if __name__ == "__main__":
         test_model_registry_switch()
         test_context_usage_display()
         test_model_slash_command()
+        test_run_round_auto()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

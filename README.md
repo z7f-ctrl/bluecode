@@ -28,7 +28,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 |---|---|
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（34 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（39 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -143,13 +143,14 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 34 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 39 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
 # 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
 # executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
 # LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 /
 # web 搜索与抓取（含 SSRF IPv6 变体）/ doctor 自检判定 / init 写配置 / 并行只读调用去重 /
-# 权限批次单次读配置 / grep 大文件跳过 / _command_head 优先级
+# 权限批次单次读配置 / grep 大文件跳过 / resume checkpoint 探测 / _command_head 优先级 /
+# 模型注册表切换 / 上下文占用显示 / /model 斜杠命令 / run_round_auto 自动回归
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 ```
@@ -187,8 +188,13 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
 | v0.7.1 | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
 | v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
-| v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
-| backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
+| v0.7.3 | benchmark 双判据：FAIL_TO_PASS/PASS_TO_PASS（报告区分「未修复」与「修坏回归」，为 BugsInPy 铺判据基础设施） | ✅ 已实现 |
+| v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | 设计稿就绪 |
+| v0.9 | BugsInPy pilot（5–10 题轻依赖，独立 venv，双判据判分；验证 Python 3.14 环境可行性后定扩量） | 未实现 |
+| v0.10 | Web 观测增强：图小地图 / token 面板 / 审计尾部（M3）+ 模型切换器 / benchmark 结果查看器（M4 可选） | 未实现 |
+| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量（v0.9 pilot 后定） | 暂缓 |
+
+> LangGraph Studio 已从 backlog 关闭：v0.8 的图小地图 + 事件流满足其约 80% 需求，不再单独集成。
 
 ## 安全说明（重要）
 

@@ -1465,7 +1465,7 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
 
     banner = _c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE)
     _run_graph_core(graph, sess, request, banner=banner, drain=_auto_drain)
-    return graph.get_state(config).values
+    return graph.get_state(sess.config).values
 
 
 # ─────────────────────────── #7 模块拆分：重导出（facade） ───────────────────────────
