@@ -39,7 +39,9 @@ class Session:
         self.round = 0
         self.created_at = datetime.now().isoformat(timespec="seconds")
         # 会话级 token 累计（内存，不落库；重启清零）
-        self.token_usage = {"prompt": 0, "completion": 0, "calls": 0}
+        # context = 会话内峰值单次调用 prompt tokens（"当前上下文占用"的近似，
+        # 跨轮取 max：历史累积只增，压缩后可能回落，max 反映最接近窗口的时刻）
+        self.token_usage = {"prompt": 0, "completion": 0, "calls": 0, "context": 0}
 
     @property
     def config(self) -> dict:

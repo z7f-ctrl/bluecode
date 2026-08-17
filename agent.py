@@ -137,12 +137,17 @@ _plain_model_cache: ChatOpenAI | None = None
 
 
 def _base_kwargs() -> dict:
-    kwargs: dict = {"model": os.environ.get("MODEL_NAME", "gpt-4o-mini")}
-    if os.environ.get("OPENAI_BASE_URL"):
-        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
-    if os.environ.get("OPENAI_API_KEY"):
-        kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
-    return kwargs
+    """构造 ChatOpenAI 的 kwargs：经多模型注册表解析（models.py），
+    未注册时回落纯环境变量旧行为（MODEL_NAME/OPENAI_BASE_URL/OPENAI_API_KEY）。"""
+    from models import model_kwargs
+    return model_kwargs()
+
+
+def _reset_model_cache() -> None:
+    """清空模型实例缓存：/model 切换激活模型后调用，下次 _make_model 用新配置重建。"""
+    global _model_cache, _plain_model_cache
+    _model_cache = None
+    _plain_model_cache = None
 
 
 def _make_model() -> ChatOpenAI:
@@ -200,12 +205,48 @@ def _llm_log_enabled() -> bool:
     return os.environ.get("BLUE_LOG_LLM", "").lower() in ("1", "true", "yes", "on")
 
 
+# ─────────────────────────── 多模型管理（v0.8） ───────────────────────────
+# 注册表 ~/.blue/models.toml + /model 命令（cli 侧）切换激活模型。
+# 切换后必须 _reset_model_cache()：模型实例是模块级单例，不重建则切了白切。
+# 纯配置逻辑在 models.py；这里只提供带缓存失效的包装（测试 patch "agent.X" 契约）。
+
+
+def list_models() -> list[dict]:
+    """有序模型列表（/model 展示用）。"""
+    from models import list_models as _list
+    return _list()
+
+
+def current_model_name() -> str:
+    """当前激活模型名。"""
+    from models import active_model_name
+    return active_model_name()
+
+
+def set_active_model(name: str) -> str:
+    """切换激活模型并清空模型缓存。返回提示文本（成功/失败均人可读）。"""
+    from models import set_active_model as _set
+    ok, msg = _set(name)
+    if ok:
+        _reset_model_cache()
+        return f"已切换模型 → {msg}"
+    return f"切换失败：{msg}"
+
+
+def active_context_window() -> int:
+    """当前激活模型的上下文窗口大小（token）。"""
+    from models import context_window
+    return context_window()
+
+
 # ─────────────────────────── token 用量追踪 ───────────────────────────
 # _logged_invoke 统一入口无条件累加（带锁，并行 worker 共用）；每轮需求结束
 # 打印本轮消耗并计入 Session。单次调用明细见 BLUE_LOG_LLM=1 的 LLM 全文日志。
 
 _TOKEN_LOCK = threading.Lock()
-_TOKEN_COLLECTOR = {"prompt": 0, "completion": 0, "calls": 0}
+# context = 本轮峰值单次调用 prompt tokens（近似"上下文占用"：一次调用发给
+# 模型的输入即当时上下文大小，取峰值反映最接近窗口上限的时刻）
+_TOKEN_COLLECTOR = {"prompt": 0, "completion": 0, "calls": 0, "context": 0}
 
 
 def _extract_usage(resp) -> tuple[int, int]:
@@ -225,11 +266,12 @@ def _record_usage(resp) -> None:
         _TOKEN_COLLECTOR["prompt"] += p
         _TOKEN_COLLECTOR["completion"] += c
         _TOKEN_COLLECTOR["calls"] += 1
+        _TOKEN_COLLECTOR["context"] = max(_TOKEN_COLLECTOR["context"], p)
 
 
 def _reset_token_usage() -> None:
     with _TOKEN_LOCK:
-        _TOKEN_COLLECTOR.update(prompt=0, completion=0, calls=0)
+        _TOKEN_COLLECTOR.update(prompt=0, completion=0, calls=0, context=0)
 
 
 def _token_usage_snapshot() -> dict:
@@ -1157,17 +1199,32 @@ def _audit_log(thread_id: str, decision: dict, changes: list[dict]) -> None:
         pass
 
 
+def _context_usage_str(context: int) -> str:
+    """上下文占用串：峰值 prompt / 窗口大小（百分比）。窗口取当前激活模型配置，
+    未配置回落默认 128k；context 为 0（无调用）时返回空串。"""
+    if not context:
+        return ""
+    window = active_context_window()
+    pct = context * 100.0 / window if window else 0.0
+    return f"｜上下文 {context:,}/{window:,} ({pct:.1f}%)"
+
+
 def _finish_round_usage(sess: Session) -> None:
-    """一轮需求结束：汇总本轮 token 消耗，计入 Session 并播报。"""
+    """一轮需求结束：汇总本轮 token 消耗，计入 Session 并播报。
+    context 是峰值状态量：跨轮取 max（历史累积只增），不做加法累计。"""
     usage = _token_usage_snapshot()
     for k in sess.token_usage:
+        if k == "context":
+            continue
         sess.token_usage[k] += usage.get(k, 0)
+    sess.token_usage["context"] = max(sess.token_usage.get("context", 0), usage.get("context", 0))
     if usage["calls"]:
         total = usage["prompt"] + usage["completion"]
         sess_total = sess.token_usage["prompt"] + sess.token_usage["completion"]
         print(_c(
             f"[蓝] 📊 本轮 token：{usage['prompt']} + {usage['completion']} = {total}"
-            f"（{usage['calls']} 次调用）{_round_cost_str(usage)}｜会话累计 {sess_total}",
+            f"（{usage['calls']} 次调用）{_round_cost_str(usage)}"
+            f"{_context_usage_str(usage.get('context', 0))}｜会话累计 {sess_total}",
             _C.DIM,
         ))
 
@@ -1429,6 +1486,10 @@ from cli import (  # noqa: E402,F401
 from doctor import (  # noqa: E402,F401
     _check_python, _check_deps, _check_config, _check_blue_dir, _fetch_model_ids,
     _check_api_and_model, _check_tool_calling, cmd_doctor, _write_env_file, cmd_init,
+)
+from models import (  # noqa: E402,F401
+    MODELS_PATH, DEFAULT_CONTEXT_WINDOW, load_models, active_model_name,
+    context_window, list_models as _registry_list_models,
 )
 
 

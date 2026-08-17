@@ -43,11 +43,22 @@ def _check_deps() -> list[tuple[bool, str]]:
 
 
 def _check_config() -> tuple[bool, str]:
-    missing = [k for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL_NAME")
-               if not os.environ.get(k, "").strip()]
+    """配置自检：env 三键为主，多模型注册表（~/.blue/models.toml）可补
+    base_url/model；api_key 需 env 或激活条目自带其一。"""
+    import agent  # 测试契约：validate_graph patch("agent.X")，必须走 agent 命名空间
+    registry = agent.load_models()
+    active_cfg = registry.get(agent.current_model_name()) or {}
+    missing = []
+    if not (os.environ.get("OPENAI_API_KEY", "").strip() or active_cfg.get("api_key")):
+        missing.append("OPENAI_API_KEY")
+    if not (os.environ.get("OPENAI_BASE_URL", "").strip() or active_cfg.get("base_url")):
+        missing.append("OPENAI_BASE_URL")
+    if not (os.environ.get("MODEL_NAME", "").strip() or registry):
+        missing.append("MODEL_NAME")
     if missing:
         return False, f"配置缺失：{', '.join(missing)}（跑 blue init，或检查 .env / ~/.blue/.env）"
-    return True, "三项配置齐全（OPENAI_API_KEY/OPENAI_BASE_URL/MODEL_NAME）"
+    src = "env + models.toml" if registry else "三项环境变量"
+    return True, f"配置齐全（{src}）"
 
 
 def _check_blue_dir() -> tuple[bool, str]:
@@ -64,20 +75,24 @@ def _check_blue_dir() -> tuple[bool, str]:
 
 
 def _fetch_model_ids() -> list[str]:
-    """GET {base}/models 返回可用模型 id 列表；异常原样抛出，由调用方整形为诊断文本。"""
-    base = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+    """GET {base}/models 返回可用模型 id 列表；异常原样抛出，由调用方整形为诊断文本。
+    端点/key 按激活模型解析（models.toml 条目优先，缺省回落 env）。"""
+    from models import model_kwargs
+    kw = model_kwargs()
+    base = str(kw.get("base_url") or os.environ.get("OPENAI_BASE_URL", "")).strip().rstrip("/")
     req = urllib.request.Request(
         base + "/models",
-        headers={"Authorization": "Bearer " + os.environ.get("OPENAI_API_KEY", "").strip()})
+        headers={"Authorization": "Bearer " + str(kw.get("api_key") or os.environ.get("OPENAI_API_KEY", "")).strip()})
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode())
     return [m.get("id", "") for m in data.get("data", [])]
 
 
 def _check_api_and_model() -> tuple[bool, str]:
-    """API 可达 + key 有效 + MODEL_NAME 在可用列表（v1h typo / glm5.1 不存在的实测坑）。"""
+    """API 可达 + key 有效 + 激活模型在可用列表（v1h typo / glm5.1 不存在的实测坑）。
+    激活模型经 models 注册表解析（/model 切换或 [active] 配置），无注册表回落 env。"""
     import agent  # 测试契约：validate_graph patch("agent._fetch_model_ids")，必须走 agent 命名空间
-    model = os.environ.get("MODEL_NAME", "").strip()
+    model = agent.current_model_name().strip()
     try:
         # 经 agent 取用：validate_graph.py 等通过 patch("agent._fetch_model_ids")
         # 注入假响应，必须走 agent 命名空间解析（见 #7 拆分说明）。

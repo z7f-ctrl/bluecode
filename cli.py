@@ -26,13 +26,57 @@ SLASH_HELP = """可用斜杠命令：
   /help          显示本帮助
   /quit, /exit   退出当前会话
   /clear         清空当前会话的上下文（开启新 thread）
-  /history       查看本会话已完成的轮次与状态摘要
+  /history       查看本会话已完成的轮次与状态摘要（含 token/上下文占用）
   /graph         打印图拓扑
   /resume        列出历史会话并恢复（等价于启动时 --resume）
   /new           强制开启新 thread（保留旧 checkpoint）
   /undo          回退最近一次审批通过的文件改动（命令/Python 副作用不可撤）
   /retry         从断点续跑上一轮未完成的执行（异常中断/审批点均可续）
+  /model         查看/切换当前模型（多模型注册表 ~/.blue/models.toml）
 """
+
+
+def _print_model_list() -> None:
+    """打印模型列表 + 当前激活标记（/model 无参时用）。"""
+    import agent
+    current = agent.current_model_name()
+    models = agent.list_models()
+    if not models:
+        print(_c(f"[蓝] 当前模型：{current}（未配置多模型注册表）", _C.BLUE))
+        print(_c("[蓝] 提示：编辑 ~/.blue/models.toml 可配置多模型切换（格式见 README）。",
+                 _C.DIM))
+        return
+    print(_c("[蓝] 可用模型（~/.blue/models.toml）：", _C.BLUE))
+    for i, m in enumerate(models, 1):
+        mark = _c(" ← 当前", _C.GREEN) if m["name"] == current else ""
+        note = f"  {m['note']}" if m.get("note") else ""
+        print(f"  {i}. {m['name']}（{m['model']}，窗口 {m['context_window']:,}）{note}{mark}")
+
+
+def _cmd_model(arg: str, sess: Session) -> None:
+    """/model 子命令：无参列出+交互选择；带参直接切（名字或序号）。"""
+    import agent
+    arg = arg.strip()
+    models = agent.list_models()
+    if not arg:
+        _print_model_list()
+        if not models:
+            return
+        try:
+            choice = input(_prompt("输入序号或模型名切换（回车取消）> ", _C.BRIGHT_CYAN)).strip()
+        except EOFError:
+            return
+        if not choice:
+            return
+        arg = choice
+    # 序号 → 模型名
+    if arg.isdigit() and 1 <= int(arg) <= len(models):
+        arg = models[int(arg) - 1]["name"]
+    msg = agent.set_active_model(arg)
+    ok = msg.startswith("已切换")
+    print(_c(f"[蓝] 🔄 /model：{msg}", _C.GREEN if ok else _C.RED))
+    if ok:
+        print(_c("[蓝] 下一轮需求起生效（会话历史保留，新模型接续当前上下文）。", _C.DIM))
 
 
 def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
@@ -60,9 +104,14 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         vals = cur.values if cur else {}
         print(f"[蓝] 当前 thread：{sess.thread_id}")
         print(f"     已进行 {sess.round} 轮需求")
+        print(f"     当前模型：{agent.current_model_name()}（窗口 {agent.active_context_window():,}）")
         if sess.token_usage["calls"]:
             t = sess.token_usage
             print(f"     token 累计：{t['prompt']} + {t['completion']} = {t['prompt'] + t['completion']}（{t['calls']} 次调用）")
+            if t.get("context"):
+                window = agent.active_context_window()
+                pct = t["context"] * 100.0 / window if window else 0.0
+                print(f"     上下文占用：{t['context']:,}/{window:,}（{pct:.1f}%）")
         print(f"     图状态：next={list(cur.next) if cur and cur.next else '（已完成）'}")
         if vals.get("plan"):
             print(f"     最近计划：{json.dumps(vals['plan'], ensure_ascii=False)}")
@@ -78,6 +127,9 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
     if cmd == "/retry":
         if not agent.resume_pending(graph, sess):
             print("[蓝] 没有可续的断点（上一轮已正常结束）。")
+        return True, None
+    if cmd == "/model" or cmd.startswith("/model "):
+        _cmd_model(cmd[len("/model"):], sess)
         return True, None
     if cmd == "/resume":
         sessions = list_sessions()

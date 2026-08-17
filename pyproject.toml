@@ -27,4 +27,4 @@ graph = ["grandalf"]  # blue --show-graph 打印图拓扑
 blue = "agent:main"
 
 [tool.setuptools]
-py-modules = ["agent", "tools", "prompts", "session", "cli", "doctor"]
+py-modules = ["agent", "tools", "prompts", "session", "cli", "doctor", "models"]

@@ -102,7 +102,7 @@ class AgentState(TypedDict):
 | `plan_write_file` | 完整覆盖写入 |
 | `plan_patch` | old→new 文本替换：默认要求唯一匹配（歧义即拒防误改）；多处时传 `occurrence=N` 指定替换第 N 处，比重写整个文件省 token |
 | `plan_run_command` | shell 命令（timeout 60s + 黑名单拦截 + 可选白名单） |
-| `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单——不含 subprocess，防绕过命令校验 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec，getattr/setattr 包装拦 dunder 字符串参数）+ 受限 os 代理（只暴露 path/makedirs 等安全子集，system/popen/exec*/environ 一律拦截）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
+| `plan_run_python` | 受限 Python 沙箱执行：ast 静态检查（import 白名单——不含 subprocess，防绕过命令校验 + 禁 dunder 属性 + 节点数上限）+ 受限 builtins（剔 open/eval/exec，getattr/setattr 包装拦 dunder 字符串参数）+ 受限 os 代理（只暴露 path/makedirs 等安全子集，system/popen/exec*/environ/chdir 一律拦截——chdir 会把相对路径操作偏出沙箱）+ 30s 超时。适合一次组合多操作，比多次 plan_run_command 省轮次 |
 
 所有路径经 `_resolve()` 校验，越界即报错；工作目录固定为当前项目目录。
 
@@ -185,6 +185,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
 | v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
+| v0.8 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
 | v0.7.x | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
@@ -218,7 +219,42 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 > /quit          # 退出
 ```
 
-可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）。
+可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）`/model`（查看/切换模型）。
+
+### 多模型管理与 /model 切换（v0.8）
+
+编辑 `~/.blue/models.toml` 注册多个模型，会话中 `/model` 随时切换：
+
+```toml
+[models.gpt4o]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+context_window = 128000   # 上下文窗口（token），用于占用百分比显示
+note = "主力模型"
+
+[models.glm]
+model = "glm-4.6"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+context_window = 200000
+
+[active]
+name = "gpt4o"            # 默认激活；可被 MODEL_NAME 或 /model 切换覆盖
+```
+
+- 激活优先级：`/model` 运行时切换（进程内）> `MODEL_NAME` 环境变量（命中注册表用其配置）> `[active]` > 第一个。
+- 每条目 `api_key` 可选，缺省回落 `OPENAI_API_KEY`；`base_url` 缺省回落 `OPENAI_BASE_URL`——多端点共用一个 key 也够用。
+- `/model` 无参列出全部模型并交互选择（序号或名字），`/model glm` 直接切；切换后清模型缓存，**下一轮需求起生效**，会话历史保留（新模型接续当前上下文）。
+- 不配置 models.toml 时行为与旧版完全一致（纯环境变量）。
+
+### token 与上下文占用显示（v0.8）
+
+每轮需求结束自动播报：
+
+```
+[蓝] 📊 本轮 token：12,345 + 678 = 13,023（5 次调用）｜上下文 45,321/128,000 (35.4%)｜会话累计 89,000
+```
+
+「上下文占用」取本轮**峰值**单次调用的输入 token（一次调用发给模型的内容即当时上下文），除以激活模型的 `context_window`（未配置默认 128,000）。`/history` 同样显示当前模型、窗口大小与占用百分比。
 
 `/undo` 回退最近一次审批通过的文件改动：guard 执行前自动把 `changed_files` 快照到 `~/.blue/backups/<thread>/<ts>/`（已存在文件备份内容、新建文件记录路径），undo 时写回+删除。**边界：仅 `plan_write_file`/`plan_patch` 可撤；`plan_run_command`/`plan_run_python` 的副作用（装包、删文件、系统状态）不在快照内，不可撤。**单轮指针（只撤最近一轮），快照目录保留在磁盘可手动翻。
 

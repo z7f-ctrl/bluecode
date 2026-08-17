@@ -18,8 +18,15 @@ os.environ.setdefault("BLUE_TEST_DB", _TMP_DB.name)
 _TMP_BACKUPS = tempfile.mkdtemp(prefix="blue-test-backups-")
 
 import agent
+import session as _session_mod
 agent.DB_PATH = os.environ["BLUE_TEST_DB"]
+# _get_conn/_save_session_meta 读 session 模块自己的全局 DB_PATH，
+# agent.DB_PATH 只改重导出的引用——不 patch session 侧会写真实 ~/.blue
+# （普通终端下可写没暴露，受限环境直接 OperationalError）
+_session_mod.DB_PATH = os.environ["BLUE_TEST_DB"]
 agent.BACKUP_ROOT = _TMP_BACKUPS  # 快照/undo 同样隔离，不污染真实 ~/.blue/backups
+# run_round 异常路径直接调 _node_logger()（不经回调注册），节点日志目录同样隔离
+agent.LOG_DIR = os.path.join(_TMP_BACKUPS, "logs")
 
 
 class FakeModel:
@@ -1301,6 +1308,149 @@ def test_command_head_precedence():
     print("PASS command head（越界不崩 + VAR=/env 前缀跳过 + flag 不跳过）✔\n")
 
 
+def test_model_registry_switch():
+    """多模型注册表（v0.8）：TOML 解析、激活优先级、/model 切换清缓存、
+    kwargs 注册表命中/env 回落、context_window 配置读取。注册表路径与运行时
+    override 均 patch 隔离，不碰真实 ~/.blue。"""
+    import models
+    with tempfile.TemporaryDirectory() as td:
+        reg = os.path.join(td, "models.toml")
+        with open(reg, "w", encoding="utf-8") as f:
+            f.write(
+                '[models.gpt4o]\nmodel = "gpt-4o"\n'
+                'base_url = "https://api.openai.com/v1"\ncontext_window = 128000\n\n'
+                '[models.glm]\nmodel = "glm-4.6"\n'
+                'base_url = "https://open.bigmodel.cn/api/paas/v4"\ncontext_window = 200000\n\n'
+                '[active]\nname = "glm"\n'
+            )
+        with patch("models.MODELS_PATH", reg), \
+             patch.dict(os.environ, {"MODEL_NAME": "", "OPENAI_BASE_URL": "https://env.example/v1",
+                                     "OPENAI_API_KEY": "sk-env"}):
+            models.clear_active_override()
+            # ① 注册表解析
+            reg_models = models.load_models()
+            assert set(reg_models) == {"gpt4o", "glm"}, f"注册表解析错误：{reg_models}"
+            assert reg_models["glm"]["model"] == "glm-4.6"
+            assert reg_models["glm"]["context_window"] == 200000
+            # ② 激活优先级：无 env 无 override → [active].name
+            assert models.active_model_name() == "glm"
+            kw = models.model_kwargs()
+            assert kw["model"] == "glm-4.6" and kw["base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+            assert kw["api_key"] == "sk-env", "条目未配 api_key 应回落 env"
+            # ③ env 命中注册表 → 用注册表配置
+            with patch.dict(os.environ, {"MODEL_NAME": "gpt4o"}):
+                assert models.active_model_name() == "gpt4o"
+                kw = models.model_kwargs()
+                assert kw["model"] == "gpt-4o" and kw["base_url"] == "https://api.openai.com/v1"
+                assert models.context_window() == 128000
+            # ④ env 未注册 → 裸 env 回落（旧行为）
+            with patch.dict(os.environ, {"MODEL_NAME": "unknown-model"}):
+                kw = models.model_kwargs()
+                assert kw["model"] == "unknown-model" and kw["base_url"] == "https://env.example/v1"
+                assert models.context_window() == models.DEFAULT_CONTEXT_WINDOW
+            # ⑤ set_active_model + agent 缓存失效
+            ok, msg = models.set_active_model("gpt4o")
+            assert ok and models.active_model_name() == "gpt4o"
+            assert agent.set_active_model("glm").startswith("已切换")
+            assert agent._model_cache is None and agent._plain_model_cache is None, "切换必须清模型缓存"
+            assert models.active_model_name() == "glm"
+            assert models.context_window() == 200000
+            # ⑥ 非法切换 fail-closed
+            ok, msg = models.set_active_model("nope")
+            assert not ok and "不在注册表" in msg, f"非法切换应失败：{msg}"
+            # ⑦ list_models：注册表 + env 未注册补尾
+            with patch.dict(os.environ, {"MODEL_NAME": ""}):
+                names = [m["name"] for m in models.list_models()]
+                assert names == ["gpt4o", "glm"], f"列表错误：{names}"
+            with patch.dict(os.environ, {"MODEL_NAME": "env-extra"}):
+                names = [m["name"] for m in models.list_models()]
+                assert names == ["gpt4o", "glm", "env-extra"], f"env 未注册应补尾：{names}"
+        models.clear_active_override()
+    # ⑧ 无注册表文件 → 全回落 env（旧行为）
+    with patch("models.MODELS_PATH", "/nonexistent/models.toml"), \
+         patch.dict(os.environ, {"MODEL_NAME": "env-only"}):
+        models.clear_active_override()
+        assert models.load_models() == {}
+        assert models.active_model_name() == "env-only"
+        kw = models.model_kwargs()
+        assert kw["model"] == "env-only"
+    models.clear_active_override()
+    print("PASS model registry（TOML 解析 + 激活优先级 + 切换清缓存 + env 回落）✔\n")
+
+
+def test_context_usage_display():
+    """context 占用追踪（v0.8）：单次调用 prompt=上下文占用取峰值；
+    Session.context 跨轮取 max 不累加；百分比串格式；无调用不显示。"""
+    # ① _record_usage 峰值语义
+    agent._reset_token_usage()
+    m1 = AIMessage(content="x", response_metadata={"token_usage": {"prompt_tokens": 100, "completion_tokens": 5}})
+    m2 = AIMessage(content="y", response_metadata={"token_usage": {"prompt_tokens": 700, "completion_tokens": 5}})
+    m3 = AIMessage(content="z", response_metadata={"token_usage": {"prompt_tokens": 300, "completion_tokens": 5}})
+    agent._record_usage(m1)
+    agent._record_usage(m2)
+    agent._record_usage(m3)
+    snap = agent._token_usage_snapshot()
+    assert snap["prompt"] == 1100 and snap["calls"] == 3
+    assert snap["context"] == 700, f"context 应取峰值，实际 {snap['context']}"
+    # ② 百分比串
+    with patch("agent.active_context_window", lambda: 1000):
+        s = agent._context_usage_str(700)
+        assert "700" in s and "70.0%" in s, f"百分比串错误：{s}"
+        assert agent._context_usage_str(0) == "", "无调用应返回空串"
+    # ③ Session 累计语义：context 取 max，prompt/completion 累加
+    sess = agent.Session(thread_id="ctx-test")
+    with patch.object(agent, "_token_usage_snapshot",
+                      lambda: {"prompt": 100, "completion": 10, "calls": 2, "context": 500}):
+        agent._finish_round_usage(sess)
+    with patch.object(agent, "_token_usage_snapshot",
+                      lambda: {"prompt": 50, "completion": 5, "calls": 1, "context": 300}):
+        agent._finish_round_usage(sess)  # 回落轮：context 取 max 保留 500
+    t = sess.token_usage
+    assert t["prompt"] == 150 and t["completion"] == 15 and t["calls"] == 3, f"累计错误：{t}"
+    assert t["context"] == 500, f"context 跨轮应取 max（不是累加 800），实际 {t['context']}"
+    agent._reset_token_usage()
+    print("PASS context usage（峰值采集 + max 累计 + 百分比串 + 空值静默）✔\n")
+
+
+def test_model_slash_command():
+    """/model 命令：无参列出+交互选择切换；/model <名> 直接切；序号切换；
+    无注册表时提示不可切。路径 patch 隔离。"""
+    import cli
+    import models
+    with tempfile.TemporaryDirectory() as td:
+        reg = os.path.join(td, "models.toml")
+        with open(reg, "w", encoding="utf-8") as f:
+            f.write('[models.a1]\nmodel = "model-a"\nbase_url = "https://a/v1"\n'
+                    '[models.b2]\nmodel = "model-b"\nbase_url = "https://b/v1"\n')
+        sess = agent.Session(thread_id="model-cmd")
+        with patch("models.MODELS_PATH", reg), \
+             patch.dict(os.environ, {"MODEL_NAME": ""}):
+            models.clear_active_override()
+            # ① 无参 + 选择序号 2 → 切换 b2
+            with patch("builtins.input", lambda *a: "2"):
+                cli.handle_slash("/model", sess, None)
+            assert models.active_model_name() == "b2"
+            assert agent._model_cache is None, "切换后应清缓存"
+            # ② 带名直接切
+            cli.handle_slash("/model a1", sess, None)
+            assert models.active_model_name() == "a1"
+            # ③ 非法名：提示失败、不切换
+            cli.handle_slash("/model nope", sess, None)
+            assert models.active_model_name() == "a1"
+            # ④ 回车取消：不切换
+            with patch("builtins.input", lambda *a: ""):
+                cli.handle_slash("/model", sess, None)
+            assert models.active_model_name() == "a1"
+        models.clear_active_override()
+    # ⑤ 无注册表：列出提示不可切
+    with patch("models.MODELS_PATH", "/nonexistent/models.toml"):
+        models.clear_active_override()
+        with patch.dict(os.environ, {"MODEL_NAME": "env-model"}):
+            cli.handle_slash("/model", agent.Session(thread_id="x"), None)
+    models.clear_active_override()
+    print("PASS /model command（列表选择 + 直接切换 + 非法拒绝 + 无注册表提示）✔\n")
+
+
 if __name__ == "__main__":
     try:
         test_readonly_no_interrupt()
@@ -1338,6 +1488,9 @@ if __name__ == "__main__":
         test_grep_large_file_skip()
         test_resume_checkpoint_guard()
         test_command_head_precedence()
+        test_model_registry_switch()
+        test_context_usage_display()
+        test_model_slash_command()
         print("ALL OFFLINE TESTS PASSED ✅")
     finally:
         # 清理临时数据库文件

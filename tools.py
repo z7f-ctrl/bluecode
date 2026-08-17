@@ -522,9 +522,11 @@ def _restricted_builtins() -> dict:
 # os 在 import 白名单内（os.path 刚需），但 os.system("rm -rf /") 等可完全绕过命令
 # 校验——尤其是 --auto-approve（benchmark/CI）下 guard 审批门敞开，必须在命名空间层
 # 面把 os 收口成只读/安全的代理，而非直接暴露整个模块。
+# chdir 刻意不在白名单：改 cwd 会把后续相对路径操作偏出 WORKDIR 沙箱（listdir(".")/
+# open("x") 落到新目录），且沙箱代码无正当改 cwd 需求（WORKDIR 已注入命名空间）。
 _OS_SAFE_ATTRS = (
     "path", "makedirs", "mkdir", "listdir", "scandir", "walk", "rmdir",
-    "remove", "unlink", "rename", "replace", "getcwd", "chdir", "stat",
+    "remove", "unlink", "rename", "replace", "getcwd", "stat",
     "lstat", "exists", "isfile", "isdir", "islink", "access", "getpid",
     "urandom", "sep", "altsep", "pathsep", "linesep", "devnull",
 )
