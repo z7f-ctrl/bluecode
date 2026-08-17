@@ -185,8 +185,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
 | v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
-| v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
 | v0.7.1 | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
+| v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
@@ -264,7 +264,7 @@ name = "gpt4o"            # 默认激活；可被 MODEL_NAME 或 /model 切换�
 
 交互界面带颜色区分：用户输入提示符 `>`（亮青）、[蓝] 播报（蓝）、[蓝·worker]（青）、放行/成功（绿）、待审批/打回（黄）、验证失败行（红）。仅真实终端启用——管道/重定向（benchmark 子进程）自动无色；设 `NO_COLOR=1` 可强制关闭（遵循 no-color.org 惯例）。`input()` 提示符的 ANSI 码用 `\001\002` 包围（readline 光标安全），并自动启用 readline 行编辑/历史。
 
-每轮需求结束自动播报本轮 token 消耗（prompt + completion + 调用次数）与会话累计；`/history` 可查看会话累计。单次调用明细（usage/耗时/全文）见 `BLUE_LOG_LLM=1` 的 LLM 日志。
+每轮需求结束自动播报本轮 token 消耗（区分输入/输出，附模型名与调用次数）与会话累计；`/history` 可查看会话累计。单次调用明细（usage/耗时/全文）见 `BLUE_LOG_LLM=1` 的 LLM 日志。
 
 会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。
 

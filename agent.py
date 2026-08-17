@@ -1222,7 +1222,7 @@ def _finish_round_usage(sess: Session) -> None:
         total = usage["prompt"] + usage["completion"]
         sess_total = sess.token_usage["prompt"] + sess.token_usage["completion"]
         print(_c(
-            f"[蓝] 📊 本轮 token：{usage['prompt']} + {usage['completion']} = {total}"
+            f"[蓝] 📊 本轮 token（{current_model_name()}）：输入 {usage['prompt']} + 输出 {usage['completion']} = {total}"
             f"（{usage['calls']} 次调用）{_round_cost_str(usage)}"
             f"{_context_usage_str(usage.get('context', 0))}｜会话累计 {sess_total}",
             _C.DIM,

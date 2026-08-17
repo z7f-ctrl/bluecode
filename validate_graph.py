@@ -1077,7 +1077,9 @@ def test_doctor_checks():
     """doctor 各自检项判定逻辑（网络 patch 在 _fetch_model_ids / _make_plain_model 边界）。"""
     import urllib.error
     # 配置缺失 / 齐全
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "MODEL_NAME": ""}):
+    # 注册表（~/.blue/models.toml）也能提供配置，patch 掉以纯测 env 缺失场景
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "OPENAI_BASE_URL": "", "MODEL_NAME": ""}), \
+            patch("agent.load_models", lambda: {}):
         ok, msg = agent._check_config()
         assert not ok and "配置缺失" in msg
     with patch.dict(os.environ, {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "https://x/v1",
