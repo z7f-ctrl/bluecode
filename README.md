@@ -185,8 +185,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
 | v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
 | v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
-| v0.8 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
-| v0.7.x | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
+| v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
+| v0.7.1 | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
 | v0.8 | 基准扩展：FAIL_TO_PASS/PASS_TO_PASS 双判据、BugsInPy（图算法 9 题已在 v0.4.5 完成） | 未实现 |
 | backlog | LangGraph Studio（等图复杂度上来再做）、token 级流式输出 + Ctrl-C 打断、prompts 中英双语化 | 暂缓 |
 
@@ -221,7 +221,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 
 可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）`/model`（查看/切换模型）。
 
-### 多模型管理与 /model 切换（v0.8）
+### 多模型管理与 /model 切换（v0.7.2）
 
 编辑 `~/.blue/models.toml` 注册多个模型，会话中 `/model` 随时切换：
 
@@ -246,7 +246,7 @@ name = "gpt4o"            # 默认激活；可被 MODEL_NAME 或 /model 切换�
 - `/model` 无参列出全部模型并交互选择（序号或名字），`/model glm` 直接切；切换后清模型缓存，**下一轮需求起生效**，会话历史保留（新模型接续当前上下文）。
 - 不配置 models.toml 时行为与旧版完全一致（纯环境变量）。
 
-### token 与上下文占用显示（v0.8）
+### token 与上下文占用显示（v0.7.2）
 
 每轮需求结束自动播报：
 
