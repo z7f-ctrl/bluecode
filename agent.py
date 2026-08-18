@@ -25,6 +25,14 @@ CLI 交互在 __main__ 分支。
 
 from __future__ import annotations
 
+# 版本号单一来源：与 pyproject.toml 的 version 对齐；pipx 安装后优先读包元数据覆盖，
+# 源码直跑（bluecode 未作为包安装）时回落到此常量。
+try:
+    from importlib.metadata import version as _pkg_version
+    BLUE_VERSION = _pkg_version("bluecode")
+except Exception:
+    BLUE_VERSION = "0.8.0"
+
 import argparse
 import json
 import logging
@@ -1418,6 +1426,8 @@ def main() -> None:
             sys.exit(1)
         sys.exit(web_main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description="小蓝 Blue —— 本地个人 coding agent")
+    parser.add_argument("--version", action="version",
+                        version=f"小蓝 Blue {BLUE_VERSION}", help="显示版本号并退出")
     parser.add_argument("request", nargs="?", default=None, help='要做的事，例如 "给 hello.py 加错误处理并写测试"；子命令：init / doctor / web')
     parser.add_argument("--show-graph", action="store_true", help="打印图拓扑后退出")
     parser.add_argument("--resume", action="store_true", help="恢复历史会话")

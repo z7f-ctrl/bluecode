@@ -453,6 +453,7 @@ def test_health_masking_and_token():
             assert "secret-host" not in r.text, f"base_url 未掩码：{body}"
             assert "sk-web-smoke-key" not in r.text, "key 泄露"
             assert set(body["permissions"]) == {"write", "command", "python"}, body
+            assert body.get("version"), f"health 未返回版本号：{body}"
 
         # token 模式：无头 401，正确 Bearer 200（health 也在校验范围内）
         app_t, _ = make_app(token="tok-123")

@@ -174,6 +174,8 @@ async function loadHealth() {
     const permTxt = p
       ? `权限 write=${p.write ?? "?"} command=${p.command ?? "?"} python=${p.python ?? "?"}` : "";
     const keyTxt = keyOk === true ? "key 已配置" : keyOk === false ? "key 未配置" : "key 状态未知";
+    const verEl = $("#ver");
+    if (verEl && h?.version) verEl.textContent = `v${h.version}`;
     badge.title = [model, host, keyTxt, permTxt].filter(Boolean).join("｜");
   } catch (e) {
     badge.replaceChildren(el("span", "dot bad"), el("span", "model", "服务不可达"));

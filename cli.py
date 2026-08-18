@@ -427,7 +427,7 @@ def run_interactive(graph, request: str | None = None, sess: Session | None = No
     sess = sess or Session()
     if request:
         agent.run_round(graph, sess, request)
-    print(_c("\n[蓝] 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
+    print(_c(f"\n[蓝] 小蓝 Blue v{agent.BLUE_VERSION} —— 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
     while True:
         try:
             line = input(_prompt("\n> ", _C.BRIGHT_CYAN)).strip()

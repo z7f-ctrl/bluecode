@@ -127,6 +127,7 @@ def create_app(registry: ExecutorRegistry | None = None, *,
             "key_configured": bool(kwargs.get("api_key")),
             "permissions": tools.load_permissions(),
             "auth": "token" if token else "loopback",
+            "version": agent.BLUE_VERSION,
         }
 
     @app.get("/api/audit", dependencies=[auth])
@@ -298,6 +299,8 @@ def create_app(registry: ExecutorRegistry | None = None, *,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="blue web", description="小蓝 Web 控制台（v0.8）")
+    parser.add_argument("--version", action="version",
+                        version=f"小蓝 Blue {agent.BLUE_VERSION}", help="显示版本号并退出")
     parser.add_argument("--host", default="127.0.0.1", help="绑定地址（默认仅本机 127.0.0.1）")
     parser.add_argument("--port", type=int, default=8765, help="端口（默认 8765）")
     parser.add_argument("--token", default=None,
@@ -325,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(token=token, concurrency=args.concurrency)
     url = f"http://{args.host}:{args.port}"
     print(f"[蓝] 🌐 Web 控制台启动：{url}"
-          + ("（token 模式：请求需带 Authorization: Bearer）" if token else "（仅本机访问）"))
+          + ("（token 模式：请求需带 Authorization: Bearer）" if token else "（仅本机访问）")
+          + f"（v{agent.BLUE_VERSION}）")
     if generated_token:
         print(f"[蓝] 🔑 随机 token（请保存，重启后失效）：{token}")
     if not args.no_browser and _is_loopback(args.host):

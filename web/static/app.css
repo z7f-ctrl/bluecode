@@ -61,6 +61,7 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .logo { font-weight: 700; font-size: 15px; margin-right: auto; }
+.ver { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
 
 .health {
   display: inline-flex;
