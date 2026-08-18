@@ -141,9 +141,13 @@ bluecode/
 ├── .env                # 本地配置（不入库，含密钥）
 ├── design.md           # v0.1 设计稿（历史文档，实现已演进超出）
 └── benchmarks/
-    └── quixbugs/       # QuixBugs 修 bug 基准（40 题 = 31 简单 + 9 图算法，见 README）
-        ├── prepare.py        # 题库提取
-        ├── run_benchmark.py  # 基准 runner
+    ├── quixbugs/       # QuixBugs 修 bug 基准（40 题 = 31 简单 + 9 图算法，见 README）
+    │   ├── prepare.py        # 题库提取
+    │   ├── run_benchmark.py  # 基准 runner
+    │   └── README.md
+    └── bugsinpy/       # BugsInPy 真实仓库 bug 基准（v0.8.1 pilot，见 README）
+        ├── prepare.py        # 任务提取（坏钉放宽 + meta）
+        ├── run_benchmark.py  # 独立 venv + 精确 F2P/P2P 判分 runner
         └── README.md
 ```
 
@@ -188,6 +192,23 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 
 详见 `benchmarks/quixbugs/README.md`。
 
+## Benchmark（BugsInPy，v0.8.1 pilot）
+
+[bugsInPy](https://github.com/soarsmu/BugsInPy) 真实仓库 bug 基准（pilot 收录经自验的题）：
+
+```bash
+git clone --depth 1 https://github.com/soarsmu/BugsInPy.git /tmp/bugsinpy-src  # 元数据
+python3 benchmarks/bugsinpy/prepare.py              # 提取任务（tasks/）
+python3 benchmarks/bugsinpy/run_benchmark.py --self-test   # 环境+判据自验（加题门槛）
+python3 benchmarks/bugsinpy/run_benchmark.py --bug httpie/2  # 单题
+python3 benchmarks/bugsinpy/run_benchmark.py        # 全量
+```
+
+与 QuixBugs 的差异（探针实测）：每题独立 venv（pyenv 旧解释器，缓存 `~/.blue/bip-envs`）；
+依赖做「坏钉放宽」（剔除 cffi/brotlipy 精确钉，arm64 macOS 编译失败）；F2P 用
+「buggy 失败 ∧ fixed 通过」精确收敛（元数据漂移会产生 buggy/fixed 都失败的环境坏测试，
+纯基线采集会误收）。详见 `benchmarks/bugsinpy/README.md`。
+
 ## Roadmap
 
 | 版本 | 内容 | 状态 |
@@ -207,7 +228,7 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
 | v0.7.3 | benchmark 双判据：FAIL_TO_PASS/PASS_TO_PASS（报告区分「未修复」与「修坏回归」，为 BugsInPy 铺判据基础设施） | ✅ 已实现 |
 | v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | ✅ 已实现 |
-| v0.8.1 | BugsInPy pilot（5–10 题轻依赖，独立 venv，双判据判分；验证 Python 3.14 环境可行性后定扩量） | 未实现 |
+| v0.8.1 | BugsInPy pilot（独立 venv + 精确 F2P/P2P 判分；python_version 钉旧解释器、坏钉放宽；`--self-test` 加题门槛） | ✅ 已实现（pilot：httpie/2 自验+E2E；扩量待补题） |
 | v0.8.2| Web 观测增强：图小地图 / token 面板 / 审计尾部（M3）+ 模型切换器 / benchmark 结果查看器（M4 可选） | 未实现 |
 | backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量 | 暂缓 |
 

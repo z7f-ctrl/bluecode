@@ -31,7 +31,7 @@ try:
     from importlib.metadata import version as _pkg_version
     BLUE_VERSION = _pkg_version("bluecode")
 except Exception:
-    BLUE_VERSION = "0.8.0"
+    BLUE_VERSION = "0.8.1"
 
 import argparse
 import json

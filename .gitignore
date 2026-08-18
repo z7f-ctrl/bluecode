@@ -34,6 +34,8 @@ test1.py
 # benchmark 生成物（任务目录由 prepare.py 生成，结果文件每次跑新增）
 benchmarks/quixbugs/tasks/
 benchmarks/quixbugs/results/
+benchmarks/bugsinpy/tasks/
+benchmarks/bugsinpy/results/
 
 # 工具生成物（AI 辅助分析等，不入库）
 .understand-anything/
