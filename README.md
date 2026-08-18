@@ -27,7 +27,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
-| `blue web` | 启动 Web 控制台（v0.8：对话 + 实时过程 + 逐条审批 + 会话管理；详见下节） |
+| `blue web` | 启动 Web 控制台（v0.8：对话 + 实时过程 + 逐条审批 + 会话管理；TTY 下终端同时进入交互 REPL，与页面同步；`--no-repl` 纯服务） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
 | `python validate_graph.py` | 离线功能验证（45 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
@@ -168,10 +168,11 @@ bluecode/
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 
-# Web 后端冒烟（v0.8，12 场景）：只读轮 / 写轮全链路（暂存→审批卡→详情→approve→真写入→
+# Web 后端冒烟（v0.8，16 场景）：只读轮 / 写轮全链路（暂存→审批卡→详情→approve→真写入→
 # 审计 source:web→SSE 重放）/ reject+选批 / 重启重建审批卡续跑 / retry / undo /
-# health 掩码+token 校验 / 415+非 loopback token 强制 / 结构化 diff / 跨会话事件不串扰 /
-# CLI 客户端模式（probe→建会话→发需求→SSE→快照一致）/ 跨进程锁 API 面（CLI 持锁时 Web 409）
+# health 掩码+token 校验 / 静态资源 / audit+models 端点 / 415+非 loopback token 强制 /
+# 结构化 diff / 跨会话事件不串扰 / CLI 客户端模式（probe→建会话→发需求→SSE→快照一致）/
+# blue web REPL 模式（uvicorn 后台线程 + 交互 REPL 单写者同步）/ 跨进程锁 API 面（CLI 持锁时 Web 409）
 python web/tests/smoke_web.py
 # 期望输出：ALL WEB SMOKE TESTS PASSED ✅
 ```
@@ -268,6 +269,8 @@ python3 benchmarks/bugsinpy/run_benchmark.py        # 全量
 可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/context`（压缩可见性）`/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）`/model`（查看/切换模型）。
 
 ### CLI 与 Web 双向同步（v0.8.x）
+
+**终端 REPL 模式（v0.8.4）**：`blue web` 在 TTY 下启动后，终端不再是服务端日志镜像，而是与 Web 页面平级的交互控制台（uvicorn 转后台线程并静音，主线程跑客户端 REPL）——同一引擎单写者，两边实时同步：都能发需求、都能看到节点播报、都能审批。`/quit` 或 Ctrl-D 退出并关停服务；`--no-repl`（或 stdin 非 TTY）回退纯服务模式。
 
 `blue web` 启动后，本机再运行交互式 `blue` 会自动进入**客户端模式**（`--local` 强制直连）：执行权归一 Web 引擎进程（单写者强一致），CLI 通过 REST/SSE 成为终端版第二视图——两边同时看到节点播报、都能发需求、都能审批（y/n/m/d → 投递决策）。客户端模式命令：`/sessions`（列出 Web 端会话）`/use N`（切换会话）`/new`（新会话）`/history` `/context` `/undo` `/retry` `/status`。显式指定引擎：`blue --connect http://127.0.0.1:8765 "需求"`（单发一轮即退出）；token 模式用 `--token` 或环境变量 `BLUE_WEB_TOKEN`。
 

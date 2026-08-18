@@ -31,7 +31,7 @@ try:
     from importlib.metadata import version as _pkg_version
     BLUE_VERSION = _pkg_version("bluecode")
 except Exception:
-    BLUE_VERSION = "0.8.3"
+    BLUE_VERSION = "0.8.4"
 
 import argparse
 import json
@@ -91,6 +91,7 @@ RESUME_STREAM_TIMEOUT = 60.0  # /retry 断点续跑的墙钟超时（秒）：�
 ARCHIVE_SNAPSHOT_EVERY = 20  # archive.jsonl 每追加 N 条做一次快照（轻量版本化）
 ARCHIVE_KEEP_SNAPSHOTS = 5   # 快照保留份数（超出删最旧，防无限膨胀）
 AGENT_PROTECT_ROUNDS = 3     # 滑动窗口活动任务保护：最近 N 轮工具证据永不压缩
+QUIET_CONSOLE = False        # blue web REPL 模式置 True：服务端静默，播报由客户端 REPL 从 SSE 打印（防双份）
 # 目录常量（BLUE_DIR/DB_PATH/AUDIT_LOG/BACKUP_ROOT/ENV_GLOBAL_PATH/ARCHIVE_DIR）已迁至 session.py，
 # 经文件末尾 `from session import *` 重导出，保持 agent.X 可访问（测试 patch 用）。
 
@@ -683,7 +684,8 @@ def guard(state: AgentState) -> dict:
     perms = load_permissions()
     if all(permission_for_action(c.get("action", ""), perms) == "allow" for c in pending):
         cats = "、".join(sorted({ACTION_CATEGORY.get(c.get("action", ""), "?") for c in pending}))
-        print(_c(f"[蓝] ⚡ 配置放行（{cats}=allow）：直接执行 {len(pending)} 项改动", _C.DIM))
+        if not QUIET_CONSOLE:
+            print(_c(f"[蓝] ⚡ 配置放行（{cats}=allow）：直接执行 {len(pending)} 项改动", _C.DIM))
         _audit_log(state.get("thread_id", ""), {"action": "auto_allow"}, pending)
         ordered = _execution_order(pending)
         summary, changed_files = _execute_approved(ordered, state)
@@ -1322,12 +1324,13 @@ def _finish_round_usage(sess: Session) -> None:
     if usage["calls"]:
         total = usage["prompt"] + usage["completion"]
         sess_total = sess.token_usage["prompt"] + sess.token_usage["completion"]
-        print(_c(
-            f"[蓝] 📊 本轮 token（{current_model_name()}）：输入 {usage['prompt']} + 输出 {usage['completion']} = {total}"
-            f"（{usage['calls']} 次调用）{_round_cost_str(usage)}"
-            f"{_context_usage_str(usage.get('context', 0))}｜会话累计 {sess_total}",
-            _C.DIM,
-        ))
+        if not QUIET_CONSOLE:
+            print(_c(
+                f"[蓝] 📊 本轮 token（{current_model_name()}）：输入 {usage['prompt']} + 输出 {usage['completion']} = {total}"
+                f"（{usage['calls']} 次调用）{_round_cost_str(usage)}"
+                f"{_context_usage_str(usage.get('context', 0))}｜会话累计 {sess_total}",
+                _C.DIM,
+            ))
 
 
 def _drain(graph, config: dict, sess: Session) -> None:
@@ -1487,7 +1490,8 @@ def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain,
     # 此前 request 从不进 messages，新一轮看不到上一轮问过什么，指代全断
     state["messages"] = [HumanMessage(content=request)]
     _reset_token_usage()
-    print(banner)
+    if not QUIET_CONSOLE:
+        print(banner)
     with exec_lock(sess.thread_id, holder):
         try:
             for chunk in graph.stream(state, config=config, stream_mode="updates"):
@@ -1496,7 +1500,8 @@ def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain,
         except Exception:
             traceback.print_exc()
             _node_logger().exception("图执行异常（thread=%s）", sess.thread_id)
-            print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
+            if not QUIET_CONSOLE:
+                print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
         drain(graph, config, sess)
         _finish_round_usage(sess)
         _save_session_meta(sess)

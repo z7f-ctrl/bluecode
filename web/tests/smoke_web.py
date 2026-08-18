@@ -699,6 +699,39 @@ def test_client_mode_sync():
     print("PASS CLI 客户端模式（probe→建会话→发需求→SSE→快照/上下文一致）✔\n")
 
 
+def test_web_repl_mode():
+    """blue web REPL 模式（v0.8.4）：uvicorn 后台线程（静音）+ 主线程客户端 REPL。
+
+    服务端 QUIET_CONSOLE 生效（banner/用量不再镜像打印，防与 REPL 双份），REPL
+    （run_client）从 SSE 打印全部播报（★ 第 N 轮收到 / 本轮用量），同一引擎单写者、
+    与 Web 页面同步；退出后 QUIET_CONSOLE 复位。
+    """
+    import io
+    from contextlib import redirect_stdout
+    import webclient
+    calls = [
+        AIMessage(content='["读文件"]'),
+        AIMessage(content="先 grep", tool_calls=[
+            {"name": "grep", "args": {"pattern": "小蓝"}, "id": "r1"}]),
+        AIMessage(content="统计完成。"),
+    ]
+    p1, p2, p3 = model_patches(FakeModel(calls))
+    with p1, p2, p3:
+        app, registry = make_app()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = web_server._serve_with_repl(app, host="127.0.0.1", port=0,
+                                               token=None, open_browser=False,
+                                               request="统计项目里的中文词")
+        out = buf.getvalue()
+        assert code == 0, out
+        assert "★ 第 1 轮收到" in out, "REPL 应从 SSE 打印轮次播报"
+        assert "★ Web 第" not in out, "服务端 banner 应被 QUIET_CONSOLE 静音（防双份）"
+        assert "本轮（pass）" in out, "REPL 应打印 round_end 用量"
+        assert agent.QUIET_CONSOLE is False, "退出后 QUIET_CONSOLE 应复位"
+    print("PASS blue web REPL 模式（uvicorn 后台线程 + 交互 REPL 单写者同步）✔\n")
+
+
 def test_api_lock_conflict():
     """M1 跨进程锁的 API 面：CLI 直连进程持有锁时，Web 端 REST 拒绝并报持有方。
 
@@ -740,5 +773,6 @@ if __name__ == "__main__":
     test_diff_helpers()
     test_no_cross_session_event_leak()
     test_client_mode_sync()
+    test_web_repl_mode()
     test_api_lock_conflict()
     print("ALL WEB SMOKE TESTS PASSED ✅")

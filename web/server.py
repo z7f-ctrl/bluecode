@@ -19,6 +19,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
@@ -361,6 +362,46 @@ def create_app(registry: ExecutorRegistry | None = None, *,
 # ─────────────────────────── 启动入口（blue web 委托到此） ───────────────────────────
 
 
+def _serve_with_repl(app, *, host: str, port: int, token: str | None,
+                     open_browser: bool = True, request: str | None = None) -> int:
+    """REPL 模式（v0.8.4）：uvicorn 后台线程（静音）+ 主线程交互式客户端 REPL。
+
+    - uvicorn：log_level=error + access_log=False，服务日志不再污染终端；
+    - agent.QUIET_CONSOLE=True：banner/token/auto_allow 等服务端镜像打印静音——
+      播报统一由 REPL 从 SSE 打印（否则与 REPL 双份输出）；
+    - REPL = webclient.run_client：与浏览器同走 REST/SSE，同一引擎单写者，天然同步；
+      输入 /quit 或 Ctrl-D 退出 REPL 并关停服务。request 给定时单发一轮（测试用）。
+    """
+    import uvicorn
+
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port,
+                                           log_level="error", access_log=False))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 15
+    while not server.started:
+        if time.time() > deadline:
+            raise RuntimeError("uvicorn 启动超时")
+        time.sleep(0.05)
+    # 实际绑定端口（port=0 时由系统分配，REPL 与浏览器必须连真实端口）
+    bound = server.servers[0].sockets[0].getsockname()[1] if port == 0 else port
+    url = f"http://{host}:{bound}"
+    if open_browser and _is_loopback(host):
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    print(f"[蓝] 🌐 Web 控制台启动：{url}（v{agent.BLUE_VERSION}）")
+    if token:
+        print(f"[蓝] 🔑 会话 token（请求需带 Authorization: Bearer）：{token}")
+    print("[蓝] 终端已切换为交互控制台（与 Web 页面实时同步，同一引擎）——输入 /quit 退出并关停服务。")
+    agent.QUIET_CONSOLE = True
+    try:
+        from webclient import run_client
+        return run_client(url, token=token, request=request)
+    finally:
+        agent.QUIET_CONSOLE = False
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="blue web", description="小蓝 Web 控制台（v0.8）")
     parser.add_argument("--version", action="version",
@@ -371,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Bearer token（非 loopback 绑定必填；或环境变量 BLUE_WEB_TOKEN）")
     parser.add_argument("--concurrency", type=int, default=1, help="并发执行数（默认 1，全局串行）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--no-repl", action="store_true",
+                        help="终端不进入交互 REPL（仅跑服务；stdin 非 TTY 时自动等同此模式）")
     args = parser.parse_args(argv)
 
     token = args.token or os.environ.get("BLUE_WEB_TOKEN") or None
@@ -390,6 +433,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(1) from None
 
     app = create_app(token=token, concurrency=args.concurrency)
+    # REPL 模式（v0.8.4）：终端 = 与 Web 页面平级的交互控制台（单写者引擎，双视图同步）。
+    # 服务端 uvicorn 转后台线程并静音，主线程跑客户端 REPL（webclient.run_client）——
+    # 播报全走 SSE 由 REPL 打印，不再当日志镜像。stdin 非 TTY（管道/CI/systemd）自动回退
+    # 纯服务模式（uvicorn.run 前台阻塞）。
+    if sys.stdin.isatty() and not args.no_repl:
+        return _serve_with_repl(app, host=args.host, port=args.port, token=token,
+                                open_browser=not args.no_browser)
+
     url = f"http://{args.host}:{args.port}"
     print(f"[蓝] 🌐 Web 控制台启动：{url}"
           + ("（token 模式：请求需带 Authorization: Bearer）" if token else "（仅本机访问）")

@@ -558,6 +558,9 @@ def run_client(base: str = DEFAULT_BASE, token: str | None = None,
             except EOFError:
                 print(cli._c("\n[蓝] 👋 输入流关闭，退出。", cli._C.BLUE))
                 break
+            except KeyboardInterrupt:
+                print(cli._c("\n[蓝] 👋 Ctrl-C，退出。", cli._C.BLUE))
+                break
             if not line:
                 continue
             if line.startswith("/"):

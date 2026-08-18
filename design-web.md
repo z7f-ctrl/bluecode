@@ -1,7 +1,7 @@
 # Bluecode Web 控制台 设计方案（设计稿 v1）
 
-> 状态：**设计稿，未实现**。定位：全功能交互控制台（发起需求 + 实时过程 + 逐条审批 + 会话管理），
-> 零构建轻前端，默认仅本机 localhost 访问。读者：后续实现者（人或 agent）。
+> 状态：**已全部实现**（M0–M4 已落地；CLI/Web 双向同步 v0.8.x；终端 REPL 模式 v0.8.4）。
+> 读者：后续实现者（人或 agent）。偏差记录见 §15。
 > 姊妹文档：`design.md`（v0.1 核心设计稿，历史文档）。
 
 ---
@@ -311,8 +311,11 @@ packages = ["web"]                       # 新增：web 是带静态资源的包
 web = ["static/**/*"]                    # index.html/js/css/vendor 随包分发
 ```
 
-启动方式（与 `init`/`doctor` 子命令先例一致）：`blue web [--host --port --concurrency --no-browser]`，
+启动方式（与 `init`/`doctor` 子命令先例一致）：`blue web [--host --port --concurrency --no-browser --no-repl]`，
 缺 web 依赖时给一行安装提示（fastapi ImportError 捕获后 fail-fast，退出码 1）。开发态 `python web/server.py` 直跑。
+**终端 REPL 模式（v0.8.4）**：TTY 下 `blue web` 的终端不再是服务端日志镜像，而是与 Web 页面平级的交互控制台
+（uvicorn 转后台线程并静音，主线程跑 `webclient.run_client`；`agent.QUIET_CONSOLE` 静音服务端镜像打印防双份；
+`/quit`/Ctrl-D 退出并关停服务；`--no-repl` 或 stdin 非 TTY 回退纯服务模式）。
 
 ---
 
@@ -398,5 +401,6 @@ M0–M2 实现与本文的偏离，全部记录在案（实现方与协议方共
 | §10 模块 | `approve.py` 独立 | 并入 `events.py`（卡构造/预览/diff/决策校验同文件） | 无功能差异 |
 | §6.4 / §6.5 | 图小地图 + 命令面板 | 图小地图 v0.8.2 已做（手绘 SVG + 节点状态机）；命令面板（`/` 唤起）未做（归 backlog）；模型切换器 v0.8.2 已做（观测面板「模型」块） | M3/M4 验收合格 |
 | §8 并发 | 全局串行 + 409 | 另加：**step 回调按执行线程过滤**（`executor._step_bridge`） | 防会话 A 执行中、会话 B 排队时 A 的节点事件混入 B 的 SSE（评审发现的 P2，已修 + 回归测试 `test_no_cross_session_event_leak`） |
+| §9/§11 启动 | `blue web` 前台跑 uvicorn，终端当日志镜像 | **终端 REPL 模式**（v0.8.4）：uvicorn 转后台线程（log_level=error + access_log=False），主线程跑 `webclient.run_client` 交互 REPL（与 Web 页面同引擎单写者、REST/SSE 同步）；`agent.QUIET_CONSOLE=True` 静音 banner/token/auto_allow 等服务端镜像打印（防双份）；TTY 检测，非 TTY 或 `--no-repl` 回退纯服务模式 | 终端 = 第二交互面（用户诉求），非日志镜像 |
 | §9 前端 | 组件化示例结构 | 单文件 `app.js`（879 行）无框架、无构建 | 符合零构建选型；M3 观测面板在此文件上增量 |
 | §12 测试 | httpx 归口 extras | `web` extras = fastapi+uvicorn；`test` extras = httpx（requirements.txt 同步补齐） | 依赖声明闭环，`pip install bluecode[web]` / 冒烟测试均可直接装 |
