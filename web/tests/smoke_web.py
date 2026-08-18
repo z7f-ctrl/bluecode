@@ -455,6 +455,8 @@ def test_health_masking_and_token():
             assert "sk-web-smoke-key" not in r.text, "key 泄露"
             assert set(body["permissions"]) == {"write", "command", "python"}, body
             assert body.get("version"), f"health 未返回版本号：{body}"
+            assert isinstance(body.get("context_window"), int) and body["context_window"] > 0, \
+                f"health 未返回 context_window：{body}"
 
         # token 模式：无头 401，正确 Bearer 200（health 也在校验范围内）
         app_t, _ = make_app(token="tok-123")
@@ -488,6 +490,61 @@ def test_static_assets_served():
             # 反向守卫：相对引用路径不应再被服务（确认挂载点是 /static 而非根）
             assert client.get("/app.css").status_code == 404
     print("PASS 静态资源：/ 引用 /static/* 且 /static/app.css|js 可访问 ✔\n")
+
+
+def test_audit_and_models_endpoints():
+    """M3/M4 观测端点：/api/audit 尾部读取（含 source 字段）；/api/models 列表/切换/非法名。
+
+    隔离要点：AUDIT_LOG 指临时目录（写合成记录验证端点读取）；MODELS_PATH 指临时路径，
+    先验「未配注册表 → 空列表」，写注册表后验列表与切换，结尾清 override 并删文件防污染。
+    """
+    p1, p2, p3 = model_patches(FakeModel([]))
+    with p1, p2, p3:
+        # 审计：写一条合成 web 记录 → 端点读回
+        os.makedirs(os.path.dirname(agent.AUDIT_LOG), exist_ok=True)
+        with open(agent.AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "t", "thread": "x", "action": "approve",
+                                "changes": [], "source": "web"}, ensure_ascii=False) + "\n")
+        app, _ = make_app()
+        with TestClient(app) as client:
+            r = client.get("/api/audit?limit=10")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["entries"], body
+            # 前序写轮场景已落多条 web 审计，断言本场景的合成记录在列（含 source 字段）
+            assert any(e.get("thread") == "x" and e.get("source") == "web"
+                       for e in body["entries"]), body
+
+        # 模型端点：未配注册表 → 空列表 + active 有值；非法名 404
+        with patch.dict(os.environ, {"MODEL_NAME": ""}):
+            app2, _ = make_app()
+            with TestClient(app2) as client2:
+                r = client2.get("/api/models")
+                assert r.status_code == 200, r.text
+                body = r.json()
+                assert body["models"] == [], body
+                assert body["active"], body
+                r = client2.post("/api/models", json={"name": "nope"})
+                assert r.status_code == 404, r.text
+
+            # 配注册表 → 列表含条目 + 切换成功（active 变为 override）
+            models_path = Path(_models_mod.MODELS_PATH)
+            models_path.write_text(
+                '[models.webm]\nmodel = "web-m"\n\n[active]\nname = "webm"\n',
+                encoding="utf-8")
+            try:
+                app3, _ = make_app()
+                with TestClient(app3) as client3:
+                    r = client3.get("/api/models")
+                    assert r.status_code == 200, r.text
+                    assert any(m["name"] == "webm" for m in r.json()["models"]), r.text
+                    r = client3.post("/api/models", json={"name": "webm"})
+                    assert r.status_code == 200, r.text
+                    assert r.json()["active"] == "webm", r.text
+            finally:
+                _models_mod.clear_active_override()
+                models_path.unlink(missing_ok=True)
+    print("PASS 观测端点：/api/audit 尾部 + /api/models 列表/切换/非法名 ✔\n")
 
 
 def test_415_and_host_guard():
@@ -678,6 +735,7 @@ if __name__ == "__main__":
     test_undo_endpoint()
     test_health_masking_and_token()
     test_static_assets_served()
+    test_audit_and_models_endpoints()
     test_415_and_host_guard()
     test_diff_helpers()
     test_no_cross_session_event_leak()

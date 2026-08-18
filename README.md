@@ -229,8 +229,8 @@ python3 benchmarks/bugsinpy/run_benchmark.py        # 全量
 | v0.7.3 | benchmark 双判据：FAIL_TO_PASS/PASS_TO_PASS（报告区分「未修复」与「修坏回归」，为 BugsInPy 铺判据基础设施） | ✅ 已实现 |
 | v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | ✅ 已实现 |
 | v0.8.1 | BugsInPy pilot（独立 venv + 精确 F2P/P2P 判分；python_version 钉旧解释器、坏钉放宽；`--self-test` 加题门槛） | ✅ 已实现（pilot：httpie/2 自验+E2E；扩量待补题） |
-| v0.8.2| Web 观测增强：图小地图 / token 面板 / 审计尾部（M3）+ 模型切换器 / benchmark 结果查看器（M4 可选） | 未实现 |
-| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量 | 暂缓 |
+| v0.8.2| Web 观测增强：图小地图 / token·上下文面板 / 审计尾部 / 模型切换器（M3+M4） | ✅ 已实现（benchmark 结果查看器 → backlog） |
+| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量、benchmark 结果查看器（读 `results/run-*.json`，依赖 v0.9 数据） | 暂缓 |
 
 > LangGraph Studio 已从 backlog 关闭：v0.8 的图小地图 + 事件流满足其约 80% 需求，不再单独集成。
 

@@ -39,6 +39,14 @@ const state = {
   round: null,
   seenApprovals: new Set(), // 已渲染的 approval_id，防历史回放与快照重建重复出卡
   sessionSeq: 0,        // 会话切换年代，旧 SSE 回调据此作废
+  // v0.8.2 观测面板（M3/M4）
+  lastNode: null,       // 图小地图最前沿节点
+  parallelTasks: 0,     // planner 拆出的并行子任务数（worker chip）
+  roundUsage: [],       // 每轮用量 {round, prompt, completion, calls, context}（SSE round_end）
+  sessionTotal: null,   // 会话累计 {prompt, completion}（快照提供，重启后仍准）
+  contextWindow: 0,     // 激活模型上下文窗口（health）
+  models: [],           // 模型注册表（/api/models）
+  activeModel: null,
 };
 let tokenPrompted = false; // 401 时每页只 prompt 一次
 
@@ -80,6 +88,192 @@ function fmtTime(iso) {
   const d = new Date(t);
   const pad = (x) => String(x).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ── 观测面板（v0.8.2 M3/M4）：图小地图 + 用量 + 模型 + 环境 ──
+const TOPO_NODES = [
+  { id: "planner", y: 18 },
+  { id: "mid", y: 74 },
+  { id: "guard", y: 130 },
+  { id: "verifier", y: 186 },
+  { id: "reviewer", y: 242 },
+  { id: "report", y: 298 },
+];
+const MM_W = 190, MM_H = 344, MM_X = 30, MM_WID = 130, MM_HGT = 30;
+
+function svgEl(tag, attrs) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs ?? {})) n.setAttribute(k, v);
+  return n;
+}
+function buildMinimap() {
+  const wrap = $("#minimap");
+  wrap.replaceChildren();
+  const svg = svgEl("svg", { viewBox: `0 0 ${MM_W} ${MM_H}`, class: "mm" });
+  const cx = MM_X + MM_WID / 2;
+  for (let i = 0; i < TOPO_NODES.length - 1; i++) {
+    const a = TOPO_NODES[i], b = TOPO_NODES[i + 1];
+    svg.append(svgEl("line", { x1: cx, y1: a.y + MM_HGT, x2: cx, y2: b.y, class: "mm-edge" }));
+  }
+  // revise 回边：reviewer 左外侧虚线回到 agent（激活时闪一下）
+  const rev = svgEl("path", {
+    d: `M ${MM_X} ${TOPO_NODES[4].y + MM_HGT / 2} H 8 V ${TOPO_NODES[1].y + MM_HGT / 2} H ${MM_X}`,
+    class: "mm-edge revise",
+  });
+  rev.dataset.edge = "revise";
+  svg.append(rev);
+  for (const nd of TOPO_NODES) {
+    const g = svgEl("g", { class: "mm-node todo", "data-node": nd.id });
+    g.append(svgEl("rect", { x: MM_X, y: nd.y, width: MM_WID, height: MM_HGT, rx: 6 }));
+    const t = svgEl("text", { x: cx, y: nd.y + 19, class: "mm-label" });
+    t.textContent = nd.id === "mid" ? "agent" : nd.id;
+    g.append(t);
+    svg.append(g);
+  }
+  wrap.append(svg);
+}
+function minimapSet(id, cls) {
+  document.querySelectorAll(`#minimap .mm-node[data-node="${id}"]`)
+    .forEach((n) => { n.classList.remove("todo", "active", "done"); if (cls) n.classList.add(cls); });
+}
+function minimapLabel(id, text) {
+  const n = document.querySelector(`#minimap .mm-node[data-node="${id}"]`);
+  if (n) n.querySelector("text").textContent = text;
+}
+function resetMinimap() {
+  for (const nd of TOPO_NODES) minimapSet(nd.id, "todo");
+  minimapLabel("mid", "agent");
+  state.parallelTasks = 0;
+  state.lastNode = null;
+  const rev = document.querySelector(`#minimap path[data-edge="revise"]`);
+  if (rev) rev.classList.remove("flash");
+}
+function flashRevise() {
+  const rev = document.querySelector(`#minimap path[data-edge="revise"]`);
+  if (!rev) return;
+  rev.classList.remove("flash");
+  void rev.getBoundingClientRect(); // 重触发 CSS 动画
+  rev.classList.add("flash");
+}
+function markNodeDone(nodeName) {
+  if (!nodeName) return;
+  if (state.lastNode) minimapSet(state.lastNode, "done");
+  minimapSet(nodeName, "active");
+  state.lastNode = nodeName;
+}
+function renderTokenPanel() {
+  const body = $("#token-body");
+  const rounds = state.roundUsage.slice(-8);
+  if (!rounds.length && !state.sessionTotal) {
+    body.textContent = "尚未有轮次";
+    body.className = "obs-dim";
+    return;
+  }
+  body.className = "";
+  const lines = [];
+  for (const u of rounds) {
+    lines.push(`第 ${u.round} 轮：${num0(u.prompt)} + ${num0(u.completion)} = `
+      + `${num0(u.prompt) + num0(u.completion)}（${num0(u.calls)} 次）`);
+  }
+  if (rounds.length && state.roundUsage.length > rounds.length) {
+    lines.push(`…（共 ${state.roundUsage.length} 轮）`);
+  }
+  let sIn = 0, sOut = 0, peak = 0;
+  for (const u of state.roundUsage) {
+    sIn += num0(u.prompt); sOut += num0(u.completion);
+    peak = Math.max(peak, num0(u.context));
+  }
+  if (state.sessionTotal) {
+    sIn = Math.max(sIn, num0(state.sessionTotal.prompt));
+    sOut = Math.max(sOut, num0(state.sessionTotal.completion));
+  }
+  if (sIn || sOut) lines.push(`会话累计：${sIn} + ${sOut} = ${sIn + sOut}`);
+  const win = state.contextWindow || 0;
+  if (peak && win) lines.push(`上下文峰值 ${peak} / ${win}（${(peak / win * 100).toFixed(1)}%）`);
+  body.textContent = lines.join("\n");
+}
+function renderEnvPanel(h) {
+  const body = $("#env-body");
+  if (!h) { body.textContent = "加载中…"; body.className = "obs-dim"; return; }
+  body.className = "";
+  const lines = [
+    `模型 ${h.model}`, `窗口 ${h.context_window ?? "?"}`,
+    `key ${h.key_configured ? "已配置" : "未配置"}`, `auth ${h.auth}`,
+  ];
+  const p = h.permissions;
+  if (p) lines.push(`权限 write=${p.write} command=${p.command} python=${p.python}`);
+  if (h.base_url) lines.push(`base_url ${h.base_url}`);
+  body.textContent = lines.join("\n");
+  if (h.context_window) state.contextWindow = h.context_window;
+}
+async function loadModels() {
+  const list = $("#model-list");
+  try {
+    const r = await api("/api/models");
+    state.models = r.models ?? [];
+    state.activeModel = r.active;
+    list.className = "";
+    list.replaceChildren();
+    for (const m of state.models) {
+      const name = m?.name ?? m?.model ?? "";
+      if (!name) continue;
+      const row = el("div", "model-row" + (name === state.activeModel ? " active" : ""));
+      row.append(el("span", "", name + (name === state.activeModel ? " ✓" : "")));
+      if (m?.note) row.append(el("span", "obs-dim", m.note));
+      if (name !== state.activeModel) {
+        row.onclick = async () => {
+          const msg = await setModel(name);
+          $("#model-note").textContent = msg;
+          loadHealth(); loadModels();
+        };
+      }
+      list.append(row);
+    }
+    if (!state.models.length) list.textContent = "（未配置模型注册表）";
+  } catch (e) {
+    list.textContent = `模型列表加载失败：${e.message}`;
+  }
+}
+async function setModel(name) {
+  try {
+    const r = await api("/api/models", { method: "POST", body: { name } });
+    return `✅ ${r.message}（下一轮生效）`;
+  } catch (e) {
+    return `❌ ${e.message}`;
+  }
+}
+async function openAudit() {
+  const modal = $("#audit-modal");
+  const body = $("#audit-body");
+  modal.classList.remove("hidden");
+  body.textContent = "加载中…";
+  body.className = "modal-body obs-dim";
+  try {
+    const r = await api("/api/audit?limit=80");
+    const entries = r.entries ?? [];
+    body.className = "modal-body";
+    if (!entries.length) { body.textContent = "（暂无审计记录）"; return; }
+    body.replaceChildren();
+    for (const e of entries) {
+      const row = el("div", "audit-row");
+      const idx = Array.isArray(e.indices) ? ` 批 ${e.indices.map((i) => i + 1).join(",")}` : "";
+      const note = e.note ? `「${e.note}」` : "";
+      row.append(el("div", "audit-line",
+        `${e.ts ?? ""}  ${e.action ?? ""}${idx}${note}  source=${e.source ?? ""}  `
+        + `thread=${String(e.thread ?? "").slice(0, 12)}`));
+      if (Array.isArray(e.changes) && e.changes.length) {
+        const brief = e.changes.map((c) => {
+          const tgt = c?.path ?? c?.command ?? "";
+          return `${c?.action ?? ""} ${String(tgt).slice(0, 60)}`;
+        }).slice(0, 5).join("；");
+        row.append(el("div", "audit-changes obs-dim", brief));
+      }
+      body.append(row);
+    }
+  } catch (e) {
+    body.className = "modal-body";
+    body.textContent = `❌ 审计加载失败：${e.message}`;
+  }
 }
 
 // ── 流区域操作 ──
@@ -176,6 +370,7 @@ async function loadHealth() {
     const keyTxt = keyOk === true ? "key 已配置" : keyOk === false ? "key 未配置" : "key 状态未知";
     const verEl = $("#ver");
     if (verEl && h?.version) verEl.textContent = `v${h.version}`;
+    renderEnvPanel(h); // v0.8.2：环境面板（模型/窗口/key/权限）
     badge.title = [model, host, keyTxt, permTxt].filter(Boolean).join("｜");
   } catch (e) {
     badge.replaceChildren(el("span", "dot bad"), el("span", "model", "服务不可达"));
@@ -225,6 +420,10 @@ async function selectSession(tid) {
   state.running = false;
   state.awaiting = false;
   state.approvalId = null;
+  state.roundUsage = [];   // 每轮用量按会话隔离
+  state.sessionTotal = null;
+  resetMinimap();
+  renderTokenPanel();
   clearStream();
   renderSessions();
   refreshUi();
@@ -285,17 +484,43 @@ function handleEvent(type, data) {
       state.running = true;
       state.awaiting = false;
       state.approvalId = null;
+      resetMinimap(); // 新一轮：执行图清零重画
       divider(`第 ${state.round ?? "?"} 轮`);
       if (data?.request) requestBubble(state.round, data.request);
       break;
     case "node":
       nodeCard(data?.node, data?.data);
+      // 观测：节点完成推进小地图；planner 并行任务 → worker chip；reviewer revise → 回边闪
+      const n = data?.node;
+      if (n) {
+        markNodeDone(n);
+        const nd = data?.data;
+        if (n === "planner" && Array.isArray(nd?.parallel_tasks) && nd.parallel_tasks.length >= 2) {
+          state.parallelTasks = nd.parallel_tasks.length;
+          minimapLabel("mid", `worker ×${state.parallelTasks}`);
+        }
+        if (n === "reviewer" && (nd?.verdict === "revise" || nd?.verdict?.verdict === "revise")) {
+          flashRevise();
+        }
+      }
       break;
     case "approval_required":
       approvalCard(data);
+      minimapSet("guard", "active"); // guard 待批闪烁（CSS pulse）
+      state.lastNode = "guard";
       break;
     case "round_end":
       usageLine(data);
+      if (data?.usage) {
+        const u = data.usage;
+        state.roundUsage.push({
+          round: data.round ?? state.round ?? state.roundUsage.length + 1,
+          prompt: num0(u.prompt), completion: num0(u.completion),
+          calls: num0(u.calls), context: num0(u.context),
+        });
+      }
+      renderTokenPanel();
+      minimapSet("report", "done");
       state.running = false;
       state.awaiting = false;
       state.approvalId = null;
@@ -713,6 +938,12 @@ async function loadSnapshot(tid) {
       if (nextArr.length) addInfoLine("存在未完成的执行（停在非审批节点），可点「断点续跑」");
     }
   }
+  // v0.8.2：会话累计用量喂 token 面板（重启后 per-round 丢失，但累计仍在）
+  const tu = data.token_usage ?? data.usage;
+  if (tu && typeof tu === "object") {
+    state.sessionTotal = { prompt: num0(tu.prompt), completion: num0(tu.completion) };
+  }
+  renderTokenPanel();
   refreshUi();
 }
 // 无 history 时的兜底视图：轮次分隔 + 当前需求 + 计划 + 累计用量 + 最近报告
@@ -851,6 +1082,17 @@ function wireUi() {
   $("#btn-undo").onclick = () => doUndo();
   $("#btn-retry").onclick = () => doRetry();
   $("#btn-send").onclick = () => sendMessage();
+  // v0.8.2 观测面板：审计尾部 / 观测折叠 / 模型切换
+  $("#btn-audit").onclick = () => openAudit();
+  $("#audit-close").onclick = () => $("#audit-modal").classList.add("hidden");
+  $("#audit-modal").addEventListener("click", (e) => {
+    if (e.target.id === "audit-modal") $("#audit-modal").classList.add("hidden");
+  });
+  const obs = $("#obs");
+  $("#obs-toggle").onclick = () => {
+    obs.classList.toggle("collapsed");
+    $("#obs-toggle").textContent = obs.classList.contains("collapsed") ? "◂" : "▸";
+  };
   const input = $("#input");
   input.addEventListener("input", () => { autoGrow(input); refreshComposer(); });
   input.addEventListener("keydown", (e) => {
@@ -869,7 +1111,10 @@ async function boot() {
   wireUi();
   refreshUi();
   renderEmptyHint();
+  buildMinimap();
+  resetMinimap();
   await loadHealth();
+  await loadModels();
   await loadSessions();
   if (state.sessions.length) {
     const first = state.sessions[0];

@@ -396,7 +396,7 @@ M0–M2 实现与本文的偏离，全部记录在案（实现方与协议方共
 | §7.1 token | 非 loopback 无 token 拒绝启动 | **缺省自动生成随机 token 打印**（`--token` / `BLUE_WEB_TOKEN` 可固定） | 更便捷且仍 fail-closed（token 强制校验所有 /api） |
 | §4.2 SSE 鉴权 | 未规定 | token 模式走 `?token=` 查询参数 | EventSource 不能带 header 的妥协；URL 有日志暴露面，默认 loopback 模式无此问题 |
 | §10 模块 | `approve.py` 独立 | 并入 `events.py`（卡构造/预览/diff/决策校验同文件） | 无功能差异 |
-| §6.4 / §6.5 | 图小地图 + 命令面板 | 未做（归 M3/M4，v0.10） | M0–M2 验收不含此项 |
+| §6.4 / §6.5 | 图小地图 + 命令面板 | 图小地图 v0.8.2 已做（手绘 SVG + 节点状态机）；命令面板（`/` 唤起）未做（归 backlog）；模型切换器 v0.8.2 已做（观测面板「模型」块） | M3/M4 验收合格 |
 | §8 并发 | 全局串行 + 409 | 另加：**step 回调按执行线程过滤**（`executor._step_bridge`） | 防会话 A 执行中、会话 B 排队时 A 的节点事件混入 B 的 SSE（评审发现的 P2，已修 + 回归测试 `test_no_cross_session_event_leak`） |
 | §9 前端 | 组件化示例结构 | 单文件 `app.js`（879 行）无框架、无构建 | 符合零构建选型；M3 观测面板在此文件上增量 |
 | §12 测试 | httpx 归口 extras | `web` extras = fastapi+uvicorn；`test` extras = httpx（requirements.txt 同步补齐） | 依赖声明闭环，`pip install bluecode[web]` / 冒烟测试均可直接装 |

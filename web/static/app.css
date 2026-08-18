@@ -36,7 +36,7 @@ html, body {
 
 body {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px 1fr 230px;
   height: 100vh;
   overflow: hidden;
 }
@@ -415,7 +415,83 @@ details.node[open] summary::before { transform: rotate(90deg); }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-@media (max-width: 900px) {
-  body { grid-template-columns: 210px 1fr; }
+@media (max-width: 1100px) {
+  body { grid-template-columns: 210px 1fr 0px; }
+  #obs { display: none; } /* 窄屏隐藏观测面板 */
   .health .model { display: none; }
 }
+
+/* ─────────────────────────── 观测面板（v0.8.2 M3/M4） ─────────────────────────── */
+
+#obs {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-elev);
+  min-height: 0;
+  overflow-y: auto;
+}
+#obs.collapsed #obs-body { display: none; }
+.obs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.obs-title { font-weight: 700; font-size: 13px; letter-spacing: 1px; color: var(--dim); }
+.obs-block { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.obs-label { font-size: 12px; color: var(--dim); margin-bottom: 6px; }
+.obs-dim { color: var(--dim); }
+.obs-note { font-size: 12px; color: var(--dim); margin-top: 6px; white-space: pre-wrap; }
+#token-body, #env-body { font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+
+/* 图小地图 */
+.minimap { display: flex; justify-content: center; }
+.minimap svg.mm { width: 100%; max-width: 190px; }
+.mm-edge { stroke: var(--border-strong); stroke-width: 1.5; }
+.mm-edge.revise { stroke-dasharray: 4 3; stroke: var(--purple); opacity: 0.55; }
+.mm-edge.revise.flash { animation: reviseFlash 1.2s ease-out; stroke: var(--yellow); opacity: 1; }
+@keyframes reviseFlash { 0% { stroke: var(--yellow); opacity: 1; } 100% { opacity: 0.35; } }
+.mm-node rect {
+  fill: var(--bg-card); stroke: var(--border-strong); stroke-width: 1.2;
+  transition: fill 0.25s, stroke 0.25s;
+}
+.mm-node text { fill: var(--dim); font-size: 11px; text-anchor: middle; font-family: var(--mono); }
+.mm-node.todo rect { opacity: 0.55; }
+.mm-node.done rect { fill: var(--green-bg); stroke: var(--green); }
+.mm-node.done text { fill: var(--green); }
+.mm-node.active rect { fill: var(--accent-dim); stroke: var(--accent); }
+.mm-node.active text { fill: #fff; }
+.mm-node.active { animation: nodePulse 1.6s ease-in-out infinite; }
+@keyframes nodePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+/* 模型切换器 */
+#model-list { font-size: 12px; }
+.model-row {
+  padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px;
+  margin-bottom: 5px; display: flex; flex-direction: column; gap: 2px;
+  cursor: pointer;
+}
+.model-row.active { border-color: var(--accent); background: var(--accent-dim); }
+.model-row:not(.active):hover { background: var(--bg-hover); }
+
+/* 审计尾部模态 */
+.modal {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal.hidden { display: none; }
+.modal-box {
+  width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--bg-elev); border: 1px solid var(--border-strong); border-radius: 10px;
+  overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid var(--border); font-weight: 700;
+}
+.modal-body { padding: 10px 14px; overflow-y: auto; font-size: 12px; }
+.audit-row { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.audit-line { white-space: pre-wrap; word-break: break-all; }
+.audit-changes { margin-top: 2px; white-space: pre-wrap; word-break: break-all; }

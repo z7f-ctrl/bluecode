@@ -27,6 +27,7 @@
       <button id="btn-undo" class="btn" disabled>↩ 撤销本轮</button>
       <button id="btn-retry" class="btn" disabled>🔁 断点续跑</button>
     </div>
+    <button id="btn-audit" class="btn block">📋 审计尾部</button>
     <div id="status-line" class="status-line dim">空闲</div>
   </div>
 </aside>
@@ -40,6 +41,42 @@
     <button id="btn-send" class="btn primary" disabled>发送</button>
   </div>
 </main>
+
+<aside id="obs" class="obs">
+  <div class="obs-head">
+    <span class="obs-title">观测</span>
+    <button id="obs-toggle" class="btn tiny" title="收起/展开观测面板">▸</button>
+  </div>
+  <div id="obs-body">
+    <div class="obs-block">
+      <div class="obs-label">执行图</div>
+      <div id="minimap" class="minimap"></div>
+    </div>
+    <div class="obs-block">
+      <div class="obs-label">用量</div>
+      <div id="token-body" class="obs-dim">尚未有轮次</div>
+    </div>
+    <div class="obs-block">
+      <div class="obs-label">模型</div>
+      <div id="model-list" class="obs-dim">加载中…</div>
+      <div id="model-note" class="obs-note"></div>
+    </div>
+    <div class="obs-block">
+      <div class="obs-label">环境</div>
+      <div id="env-body" class="obs-dim">加载中…</div>
+    </div>
+  </div>
+</aside>
+
+<div id="audit-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span>审计日志（尾部）</span>
+      <button id="audit-close" class="btn tiny">关闭</button>
+    </div>
+    <div id="audit-body" class="modal-body obs-dim">加载中…</div>
+  </div>
+</div>
 
 <script type="module" src="/static/app.js"></script>
 </body>

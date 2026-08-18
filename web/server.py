@@ -30,7 +30,7 @@ from langchain_core.messages import HumanMessage
 import agent
 import session as session_mod
 import tools
-from models import model_kwargs
+from models import model_kwargs, list_models, set_active_model
 from session import Session
 from web.events import change_detail, format_sse, validate_decision
 from web.executor import ExecutorRegistry
@@ -129,7 +129,29 @@ def create_app(registry: ExecutorRegistry | None = None, *,
             "permissions": tools.load_permissions(),
             "auth": "token" if token else "loopback",
             "version": agent.BLUE_VERSION,
+            "context_window": agent.active_context_window(),
         }
+
+    # ── 模型（M4 观测增强：列表 / 切换，语义与 CLI /model 一致：清缓存、下一轮生效）──
+
+    @app.get("/api/models", dependencies=[auth])
+    async def models_list():
+        return {"models": list_models(), "active": agent.current_model_name(),
+                "window": agent.active_context_window()}
+
+    @app.post("/api/models", dependencies=[auth, Depends(_require_json)])
+    async def models_set(request: Request):
+        body = await request.json()
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="name 不能为空")
+        ok, msg = set_active_model(name)
+        if ok:
+            agent._reset_model_cache()  # 与 agent.set_active_model 同语义：下一轮生效
+        if not ok:
+            return _error(404, "unknown_model", msg)
+        return {"ok": True, "message": msg, "active": agent.current_model_name(),
+                "window": agent.active_context_window()}
 
     @app.get("/api/audit", dependencies=[auth])
     async def audit(limit: int = 50):
