@@ -27,6 +27,10 @@ _session_mod.DB_PATH = os.environ["BLUE_TEST_DB"]
 agent.BACKUP_ROOT = _TMP_BACKUPS  # 快照/undo 同样隔离，不污染真实 ~/.blue/backups
 # run_round 异常路径直接调 _node_logger()（不经回调注册），节点日志目录同样隔离
 agent.LOG_DIR = os.path.join(_TMP_BACKUPS, "logs")
+# 压缩摘要归档目录同样隔离（跨轮/revise 摘要落盘，P0 新增）
+_TMP_ARCHIVE = os.path.join(_TMP_BACKUPS, "archives")
+agent.ARCHIVE_DIR = _TMP_ARCHIVE
+_session_mod.ARCHIVE_DIR = _TMP_ARCHIVE
 
 
 class FakeModel:
@@ -580,6 +584,177 @@ def test_final_answer_document_passthrough():
         "正文中段/结尾必须完整保留——只给开头概述即视为正文丢失"
     assert "本次为只读任务" in fb
     print("PASS final_answer 正文完整透传（信息类任务不丢正文）✔\n")
+
+
+def test_sliding_compress_protects_active():
+    """滑动窗口活动任务保护：最近 AGENT_PROTECT_ROUNDS 轮证据永不压缩。
+
+    并行只读爆发（一条 AI 带 9 个 tool_calls）会让单轮 10 条消息、窗口只保留
+    几轮——若把正在使用的最近几轮也压掉，"刚读到的文件内容"会丢（nanobot
+    auto-compact 跳过活动任务的同款思路）。"""
+    head = [HumanMessage(content="sys"), HumanMessage(content="需求")]
+    body: list = []
+    for i in range(15):  # 15 轮 × 10 条 = 150 条，远超窗口
+        body.append(AIMessage(content=f"行动{i}", tool_calls=[
+            {"name": "read_file", "args": {"path": f"f{i}.py"}, "id": f"r{i}-{k}"}
+            for k in range(9)]))
+        for k in range(9):
+            body.append(ToolMessage(
+                content=f"文件 f{i}.py 共 1 行显示如下\n内容标记_M{i}_",
+                tool_call_id=f"r{i}-{k}"))
+    out = agent._sliding_compress(head + body, len(head), "需求")
+    joined = "\n".join(str(m.content) for m in out)
+    assert "【早前操作摘要】" in joined, "窗口溢出时应生成摘要"
+    prot = agent.AGENT_PROTECT_ROUNDS
+    for i in range(15 - prot, 15):
+        assert f"_M{i}_" in joined, f"最近 {prot} 轮（活动证据）不得被压缩：轮 {i}"
+    assert "_M0_" not in joined, "最早轮次应被压缩（内容不应原样保留）"
+    print("PASS 滑动窗口活动任务保护（最近 3 轮证据不压）✔\n")
+
+
+def test_archive_logs_cross_round_summary():
+    """跨轮压缩（planner 入口）的摘要必须落盘 archive.jsonl（游标化、可追溯）。
+
+    回归背景：压缩摘要此前只活在 messages 里、不可追溯；落盘后 /context 可查、
+    跨会话可回溯（nanobot Consolidator 思想）。"""
+    doc = "长文档正文。" * 1500  # ~10000 字符，保证第二轮触发跨轮压缩（>6000）
+    fake = FakeModel([
+        AIMessage(content='["写文档"]'),
+        AIMessage(content="完成", tool_calls=[
+            {"name": "final_answer", "args": {"answer": doc}, "id": "fa1"}]),
+        AIMessage(content='["继续"]'),
+        AIMessage(content="完成2", tool_calls=[
+            {"name": "final_answer", "args": {"answer": "好"}, "id": "fa2"}]),
+    ])
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": "t-arch"}}
+
+    def run(request):
+        st = agent.initial_state(request)
+        st["thread_id"] = "t-arch"
+        # 模拟 run_round 的需求消息注入（直接 graph.stream 不会自动注入）
+        st["messages"] = [HumanMessage(content=request)]
+        with patch("agent._make_model", lambda: fake), \
+             patch("agent._make_plain_model", lambda: fake), \
+             patch("agent.should_skip_planner", lambda r: False):
+            for chunk in graph.stream(st, config=config, stream_mode="updates"):
+                pass
+            while True:
+                cur = graph.get_state(config)
+                if not cur.next:
+                    break
+                for task in cur.tasks:
+                    if task.interrupts:
+                        for chunk in graph.stream(
+                                agent.Command(resume={"action": "approve"}),
+                                config=config, stream_mode="updates"):
+                            pass
+
+    run("写一篇超长文档")
+    run("再问一句")
+    path = os.path.join(agent.ARCHIVE_DIR, "t-arch.jsonl")
+    assert os.path.exists(path), "跨轮压缩摘要应落盘 archive.jsonl"
+    with open(path, encoding="utf-8") as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    assert len(lines) == 1, f"仅第二轮跨轮压缩应产生 1 条归档，实际 {len(lines)}"
+    assert lines[0]["cursor"] == 1 and lines[0]["source"] == "cross_round"
+    assert "写一篇超长文档" in lines[0]["summary"], "摘要应保留需求原文（指代连贯性）"
+    cur = graph.get_state(config)
+    assert any("历史会话摘要" in str(getattr(m, "content", ""))
+               for m in cur.values["messages"]), "第二轮上下文应含【历史会话摘要】"
+    print("PASS 跨轮压缩摘要落盘 archive.jsonl（游标化、需求原文保留）✔\n")
+
+
+def test_archive_cursor_and_snapshots():
+    """_append_archive：游标单调递增 + 每 20 条快照 + 快照轮转保留最近 5 份。"""
+    for i in range(130):
+        agent._append_archive("t-snap", "cross_round", f"第{i}号摘要")
+    path = os.path.join(agent.ARCHIVE_DIR, "t-snap.jsonl")
+    with open(path, encoding="utf-8") as f:
+        lines = [json.loads(l) for l in f if l.strip()]
+    assert [l["cursor"] for l in lines] == list(range(1, 131)), "游标应单调递增"
+    assert all(l["source"] == "cross_round" for l in lines)
+    snap_dir = os.path.join(agent.ARCHIVE_DIR, "backups")
+    snaps = [p for p in os.listdir(snap_dir) if p.startswith("t-snap-")]
+    assert len(snaps) == agent.ARCHIVE_KEEP_SNAPSHOTS, \
+        f"快照应保留最近 {agent.ARCHIVE_KEEP_SNAPSHOTS} 份，实际 {len(snaps)}: {sorted(snaps)}"
+    with open(os.path.join(snap_dir, "t-snap-120.jsonl"), encoding="utf-8") as f:
+        snap_lines = [json.loads(l) for l in f if l.strip()]
+    assert snap_lines[-1]["cursor"] == 120, "快照内容 = 对应游标时刻的完整归档"
+    print("PASS archive 游标递增 + 快照轮转（保留最近 5 份）✔\n")
+
+
+def test_context_command_shows_compaction():
+    """/context 命令：摊开压缩摘要 + 消息尾部 + 归档记录（压缩可见性）。"""
+    import contextlib
+    import io
+    from cli import handle_slash
+    graph = agent.build_graph(checkpointer=MemorySaver())
+    sess = _session_mod.Session(thread_id="t-ctx")
+    st = agent.initial_state("需求")
+    st["thread_id"] = "t-ctx"
+    st["messages"] = [
+        HumanMessage(content="【历史会话摘要】\n需求：旧轮正文"),
+        HumanMessage(content="当前需求"),
+    ]
+    agent._append_archive("t-ctx", "cross_round", "需求：旧轮摘要正文")
+    graph.update_state(sess.config, st)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cont, _new = handle_slash("/context", sess, graph)
+    out = buf.getvalue()
+    assert cont is True
+    assert "历史会话摘要" in out, "/context 应展示压缩摘要"
+    assert "归档记录" in out and "cross_round" in out, "/context 应展示归档记录"
+    assert "消息尾部" in out and "当前需求" in out, "/context 应展示消息尾部"
+    print("PASS /context 命令（压缩摘要 + 消息尾部 + 归档可见）✔\n")
+
+
+def test_exec_lock_cross_process():
+    """跨进程执行锁（M1）：互斥 + 可重入 + 过期接管 + 上下文自动释放。
+
+    背景：CLI 与 Web 是两个独立进程，各自直连同一 checkpoints.sqlite；对同一
+    thread 并发 graph.stream 是数据竞争（checkpoint 互相覆盖丢失）。锁把同一
+    会话的执行串行化，绝不抢活锁（fail-closed），崩溃残留靠心跳过期接管。
+    peek 只对「其他进程」的锁报告（同进程内由 busy 标志管辖，消息更准）。"""
+    import session as _s
+    tid = "t-lock"
+
+    def other_pid() -> int:
+        """把锁行 pid 改成别的进程（模拟跨进程持有）。"""
+        conn = _s._lock_conn()
+        conn.execute("UPDATE exec_locks SET pid=? WHERE thread_id=?", (os.getpid() + 1, tid))
+        conn.commit()
+        conn.close()
+        return os.getpid() + 1
+
+    _s.release_exec_lock(tid)
+    _s.acquire_exec_lock(tid, "cli")
+    assert _s.peek_exec_lock(tid) is None, "同进程持有 → 进程内 busy 管辖，peek 不报告"
+    pid2 = other_pid()
+    assert _s.peek_exec_lock(tid) == {"holder": "cli", "pid": pid2}
+    # 异持有者冲突：fail-closed，绝不抢活锁
+    try:
+        _s.acquire_exec_lock(tid, "web")
+        raise AssertionError("异持有者应抛 SessionBusyError")
+    except _s.SessionBusyError as exc:
+        assert "cli" in str(exc), "报错应带持有方信息"
+    # 同持有者可重入（Web 工作线程内二次获取安全）
+    _s.acquire_exec_lock(tid, "cli")
+    # 过期接管：持有者崩溃残留（心跳过期）自动让位
+    conn = _s._lock_conn()
+    conn.execute("UPDATE exec_locks SET heartbeat_at='2000-01-01T00:00:00' WHERE thread_id=?",
+                 (tid,))
+    conn.commit()
+    conn.close()
+    _s.acquire_exec_lock(tid, "web")
+    assert _s.peek_exec_lock(tid) is None, "接管后为同进程 web 持有 → 不对外报告"
+    # 上下文管理器：acquire → 心跳保活 → finally release
+    _s.release_exec_lock(tid)
+    with _s.exec_lock(tid, "cli"):
+        assert _s.peek_exec_lock(tid) is None  # 同进程内不对外报告
+    assert _s.peek_exec_lock(tid) is None, "锁应在 finally 释放"
+    print("PASS 跨进程执行锁（互斥/可重入/过期接管/上下文释放）✔\n")
 
 
 def test_worker_fault_tolerance():
@@ -1527,6 +1702,11 @@ if __name__ == "__main__":
         test_agent_sliding_window()
         test_report_template_saves_llm()
         test_final_answer_document_passthrough()
+        test_sliding_compress_protects_active()
+        test_archive_logs_cross_round_summary()
+        test_archive_cursor_and_snapshots()
+        test_context_command_shows_compaction()
+        test_exec_lock_cross_process()
         test_worker_fault_tolerance()
         test_token_usage_tracking()
         test_report_gets_executed_changes()

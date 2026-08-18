@@ -29,6 +29,7 @@ agent.DB_PATH = _session_mod.DB_PATH = os.path.join(_TMP, "checkpoints.sqlite")
 agent.AUDIT_LOG = os.path.join(_TMP, "audit.jsonl")
 agent.BACKUP_ROOT = os.path.join(_TMP, "backups")
 agent.LOG_DIR = os.path.join(_TMP, "logs")
+agent.ARCHIVE_DIR = _session_mod.ARCHIVE_DIR = os.path.join(_TMP, "archives")
 # 防真实 ~/.blue/config.toml（若用户配了 write=allow，guard 会跳过 interrupt）污染场景
 tools.GLOBAL_CONFIG_PATH = os.path.join(_TMP, "no-such-config.toml")
 # 防读真实 ~/.blue/models.toml（v0.7.2 坑位：doctor/init 测试须隔离用户注册表）
@@ -595,6 +596,79 @@ def test_no_cross_session_event_leak():
     print("PASS 两会话并发：A 的节点事件未混入 B 的总线（串扰回归）✔\n")
 
 
+def test_client_mode_sync():
+    """M2 CLI 客户端模式：终端通过 Web 引擎执行（单写者强一致）。
+
+    用 webclient.WebClient 走与 CLI 客户端模式完全相同的 REST/SSE 路径：
+    probe_web → create_session → send → SSE 收到 round_end → snapshot 一致
+    → /context 数据齐（压缩摘要/消息尾部/归档）。
+    """
+    import webclient
+    calls = [
+        AIMessage(content='["读文件"]'),
+        AIMessage(content="先 grep", tool_calls=[
+            {"name": "grep", "args": {"pattern": "小蓝"}, "id": "c1"}]),
+        AIMessage(content="统计完成。"),
+    ]
+    p1, p2, p3 = model_patches(FakeModel(calls))
+    with p1, p2, p3:
+        app, registry = make_app()
+        with LiveServer(app) as live:
+            base = f"http://127.0.0.1:{live.port}"
+            health = webclient.probe_web(base, timeout=2.0)
+            assert health and health.get("version"), "probe 应拿到 health"
+            wc = webclient.WebClient(base)
+            tid = wc.create_session()
+            assert tid, "create_session 应返回 thread_id"
+            status, _ = wc.send(tid, "统计项目里的中文词")
+            assert status == 202, status
+            seen: list[dict] = []
+            deadline = time.time() + 20
+            for ev in wc.events(tid, 0):
+                seen.append(ev)
+                if ev["event"] == "round_end":
+                    break
+                if time.time() > deadline:
+                    raise AssertionError(f"SSE 超时：{[e['event'] for e in seen]}")
+            events = [e["event"] for e in seen]
+            assert events[0] == "round_start", events
+            nodes = [e["data"]["node"] for e in seen if e["event"] == "node"]
+            assert nodes[0] == "planner" and "report" in nodes, nodes
+            assert seen[-1]["event"] == "round_end" and seen[-1]["data"]["verdict"] == "pass"
+            snap = wc.snapshot(tid)
+            assert snap["verdict"] == "pass" and snap["round"] == 1, snap
+            ctx = wc.context(tid)
+            assert {"summaries", "tail", "archive"} <= set(ctx), ctx.keys()
+    print("PASS CLI 客户端模式（probe→建会话→发需求→SSE→快照/上下文一致）✔\n")
+
+
+def test_api_lock_conflict():
+    """M1 跨进程锁的 API 面：CLI 直连进程持有锁时，Web 端 REST 拒绝并报持有方。
+
+    这是「CLI 与 Web 双写者」时代的兜底护栏：同一会话同一时刻只有一个执行者。
+    """
+    app, registry = make_app()
+    with TestClient(app) as client:
+        tid = client.post("/api/sessions", json={"request": ""}).json()["thread_id"]
+        # 模拟「另一进程的 CLI 直连」正在执行：acquire 后把锁行 pid 改成别的进程
+        # （同进程内持有由 busy 标志管辖，peek 不报告——跨进程锁只管别的进程）
+        _session_mod.acquire_exec_lock(tid, "cli")
+        conn = _session_mod._lock_conn()
+        conn.execute("UPDATE exec_locks SET pid=? WHERE thread_id=?",
+                     (os.getpid() + 1, tid))
+        conn.commit()
+        conn.close()
+        r = client.post(f"/api/sessions/{tid}/messages", json={"text": "新需求"})
+        assert r.status_code == 409 and r.json()["error"] == "session_busy", r.text
+        assert "cli" in r.json()["message"], r.text
+        r2 = client.post(f"/api/sessions/{tid}/undo", json={})
+        assert r2.status_code == 409 and r2.json()["error"] == "session_busy", r2.text
+        _session_mod.release_exec_lock(tid)
+        r3 = client.post(f"/api/sessions/{tid}/undo", json={})
+        assert r3.status_code == 200, r3.text  # 释放后可正常操作
+    print("PASS 跨进程锁 API 面（CLI 持锁时 Web 409 报持有方，释放后恢复）✔\n")
+
+
 if __name__ == "__main__":
     test_readonly_round()
     test_write_approve_flow()
@@ -607,4 +681,6 @@ if __name__ == "__main__":
     test_415_and_host_guard()
     test_diff_helpers()
     test_no_cross_session_event_leak()
+    test_client_mode_sync()
+    test_api_lock_conflict()
     print("ALL WEB SMOKE TESTS PASSED ✅")

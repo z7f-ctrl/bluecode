@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from langchain_core.messages import HumanMessage
 
 import agent
 import session as session_mod
@@ -195,6 +196,29 @@ def create_app(registry: ExecutorRegistry | None = None, *,
             "pending_approval": pending,
         }
 
+    @app.get("/api/sessions/{tid}/context", dependencies=[auth])
+    async def session_context(tid: str):
+        """/context 数据源（M2 客户端模式复用）：压缩摘要 + 消息尾部 + 归档记录。"""
+        rt = _runtime_or_404(tid)
+        graph = rt.ensure_graph()
+        cur = graph.get_state(rt.sess.config)
+        msgs = cur.values.get("messages", []) if cur else []
+        summaries = [
+            str(m.content) for m in msgs
+            if isinstance(m, HumanMessage) and str(m.content).startswith("【")
+        ]
+        tail = [{
+            "type": type(m).__name__.replace("Message", ""),
+            "len": len(str(m.content)),
+            "first": str(m.content).split("\n")[0][:80],
+        } for m in msgs[-5:]]
+        return {
+            "thread_id": tid,
+            "summaries": summaries,
+            "tail": tail,
+            "archive": agent.read_archive(tid, 3),
+        }
+
     @app.post("/api/sessions/{tid}/messages", dependencies=[auth, Depends(_require_json)])
     async def post_message(tid: str, request: Request):
         rt = _runtime_or_404(tid)
@@ -202,6 +226,11 @@ def create_app(registry: ExecutorRegistry | None = None, *,
         text = str(body.get("text") or "").strip()
         if not text:
             raise HTTPException(status_code=422, detail="text 不能为空")
+        # M1 跨进程执行锁（v0.8.x）：CLI 直连进程正执行该会话时拒绝，报持有方
+        held = session_mod.peek_exec_lock(tid)
+        if held:
+            return _error(409, "session_busy",
+                          f"该会话正被 {held['holder']}（pid {held['pid']}）执行中，请稍后再试")
         if not rt.try_start_round(text):
             return _error(409, "round_running", "该会话正有一轮在执行，稍后再发")
         return JSONResponse(status_code=202,
@@ -222,6 +251,11 @@ def create_app(registry: ExecutorRegistry | None = None, *,
         if waiter is None:
             # fail-closed：未知 approval_id 一律 404，绝不默认放行
             return _error(404, "unknown_approval_id", f"未知审批 {approval_id!r}")
+        # M1 跨进程执行锁：CLI 直连进程正执行（含等待审批）时拒绝跨端投递决策
+        held = session_mod.peek_exec_lock(tid)
+        if held:
+            return _error(409, "session_busy",
+                          f"该会话正被 {held['holder']}（pid {held['pid']}）执行中，请稍后再试")
         mode = rt.submit_decision(waiter, decision)
         if mode == "resume_needed":
             # 服务重启后重建的审批卡：无工作线程在等，新线程注入决策续跑
@@ -248,6 +282,10 @@ def create_app(registry: ExecutorRegistry | None = None, *,
         rt = _runtime_or_404(tid)
         if rt.busy:
             return _error(409, "round_running", "该会话正有一轮在执行，稍后再试")
+        held = session_mod.peek_exec_lock(tid)
+        if held:
+            return _error(409, "session_busy",
+                          f"该会话正被 {held['holder']}（pid {held['pid']}）执行中，请稍后再试")
         return {"result": agent._undo_latest(tid)}
 
     @app.post("/api/sessions/{tid}/retry", dependencies=[auth, Depends(_require_json)])
@@ -257,6 +295,10 @@ def create_app(registry: ExecutorRegistry | None = None, *,
         cur = graph.get_state(rt.sess.config)
         if not (cur and cur.next):
             return _error(409, "nothing_pending", "没有可续的断点（上一轮已正常结束）")
+        held = session_mod.peek_exec_lock(tid)
+        if held:
+            return _error(409, "session_busy",
+                          f"该会话正被 {held['holder']}（pid {held['pid']}）执行中，请稍后再试")
         if not rt.try_start_retry():
             return _error(409, "round_running", "该会话正有一轮在执行，稍后再试")
         return JSONResponse(status_code=202, content={"thread_id": tid, "started": True})

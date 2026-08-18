@@ -23,7 +23,7 @@ from langgraph.types import Command
 
 import agent
 import cli
-from session import Session, list_sessions
+from session import Session, list_sessions, exec_lock
 from web.events import SessionBus, build_approval_card, redact_node_output
 
 
@@ -202,7 +202,7 @@ class SessionRuntime:
         try:
             banner = agent._c(f"[蓝] ★ Web 第 {sess.next_round()} 轮收到：{text}", agent._C.BLUE)
             agent._run_graph_core(self.ensure_graph(), sess, text, banner=banner,
-                                  drain=self.web_drain)
+                                  drain=self.web_drain, holder="web")
         except BaseException as exc:  # noqa: BLE001 — 兜底成 error 事件，绝不静默丢线程
             err = exc
         finally:
@@ -229,7 +229,8 @@ class SessionRuntime:
         err: BaseException | None = None
         self.registry.semaphore.acquire()
         try:
-            agent.resume_pending(self.ensure_graph(), sess, drain=self.web_drain)
+            agent.resume_pending(self.ensure_graph(), sess, drain=self.web_drain,
+                                 holder="web")
         except BaseException as exc:  # noqa: BLE001
             err = exc
         finally:
@@ -274,16 +275,19 @@ class SessionRuntime:
         err: BaseException | None = None
         self.registry.semaphore.acquire()
         try:
-            graph = self.ensure_graph()
-            config = sess.config
-            _audit_log_web(sess.thread_id, decision, waiter.changes)
-            for chunk in graph.stream(Command(resume=decision), config=config,
-                                      stream_mode="updates"):
-                for node_name, output in chunk.items():
-                    agent._emit_step(node_name, output)
-            self.web_drain(graph, config, sess)  # 可能再遇 interrupt（多段审批）
-            agent._finish_round_usage(sess)
-            agent._save_session_meta(sess)
+            # M1 跨进程执行锁（v0.8.x）：重启重建审批卡的续跑同样占用会话，
+            # 防止与 CLI 直连进程对同一 thread 并发 stream。
+            with exec_lock(sess.thread_id, "web"):
+                graph = self.ensure_graph()
+                config = sess.config
+                _audit_log_web(sess.thread_id, decision, waiter.changes)
+                for chunk in graph.stream(Command(resume=decision), config=config,
+                                          stream_mode="updates"):
+                    for node_name, output in chunk.items():
+                        agent._emit_step(node_name, output)
+                self.web_drain(graph, config, sess)  # 可能再遇 interrupt（多段审批）
+                agent._finish_round_usage(sess)
+                agent._save_session_meta(sess)
         except BaseException as exc:  # noqa: BLE001
             err = exc
         finally:

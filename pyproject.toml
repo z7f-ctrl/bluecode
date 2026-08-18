@@ -29,7 +29,7 @@ test = ["httpx>=0.27"]                      # web/tests/smoke_web.py 冒烟测�
 blue = "agent:main"
 
 [tool.setuptools]
-py-modules = ["agent", "tools", "prompts", "session", "cli", "doctor", "models"]
+py-modules = ["agent", "tools", "prompts", "session", "cli", "doctor", "models", "webclient"]
 packages = ["web"]
 
 [tool.setuptools.package-data]

@@ -14,6 +14,8 @@ import os
 import sys
 from collections.abc import Callable
 
+from langchain_core.messages import HumanMessage
+
 from session import Session, list_sessions
 
 # 注意：不在模块级 `import agent`，否则 `python agent.py`（此时 agent 是 __main__，
@@ -27,6 +29,7 @@ SLASH_HELP = """可用斜杠命令：
   /quit, /exit   退出当前会话
   /clear         清空当前会话的上下文（开启新 thread）
   /history       查看本会话已完成的轮次与状态摘要（含 token/上下文占用）
+  /context       查看模型当前上下文构成（压缩摘要 + 消息尾部 + 归档记录）
   /graph         打印图拓扑
   /resume        列出历史会话并恢复（等价于启动时 --resume）
   /new           强制开启新 thread（保留旧 checkpoint）
@@ -79,6 +82,45 @@ def _cmd_model(arg: str, sess: Session) -> None:
         print(_c("[蓝] 下一轮需求起生效（会话历史保留，新模型接续当前上下文）。", _C.DIM))
 
 
+def _cmd_context(sess: Session, graph) -> None:
+    """/context：摊开模型当前实际拿到的上下文构成（压缩可见性）。
+
+    压缩是隐形操作（滑动窗口/跨轮/revise 摘要），模型丢上下文时无从排查；
+    此命令把"压缩摘要 + 消息尾部 + 归档记录"并列展示（nanobot /context 的移植）。
+    """
+    import agent  # 惰性取用（避免循环导入）
+    cur = graph.get_state(sess.config)
+    vals = cur.values if cur else {}
+    msgs = vals.get("messages", [])
+    print(_c(f"[蓝] 当前 thread：{sess.thread_id}｜状态消息 {len(msgs)} 条", _C.BLUE))
+    # ① 压缩摘要：模型上下文里的【…】合成消息（历史/早前操作/上一轮执行）
+    summaries = [str(m.content) for m in msgs
+                 if isinstance(m, HumanMessage) and str(m.content).startswith("【")]
+    print(_c("  ── ① 压缩摘要（模型上下文中的历史压缩标记）──", _C.DIM))
+    if summaries:
+        for text in summaries:
+            head = text.split("\n")[0]
+            print(f"    {_c(head, _C.YELLOW)}（共 {len(text)} 字符）")
+    else:
+        print("    （无压缩摘要，上下文未触发压缩）")
+    # ② 消息尾部：最近 5 条原始消息（角色/长度/首行）
+    print(_c("  ── ② 消息尾部（最近 5 条原始消息）──", _C.DIM))
+    for m in msgs[-5:]:
+        kind = type(m).__name__.replace("Message", "")
+        content = str(m.content)
+        first = content.split("\n")[0][:80]
+        print(f"    {kind:<12} {len(content):>6} 字符  {first}")
+    # ③ 归档记录：archive.jsonl 最近 3 条（跨轮/revise 摘要落盘，可追溯）
+    print(_c("  ── ③ 归档记录（archive.jsonl 最近 3 条）──", _C.DIM))
+    entries = agent.read_archive(sess.thread_id, 3)
+    if entries:
+        for e in entries:
+            preview = e["summary"].split("\n")[0][:80]
+            print(f"    #{e['cursor']} [{e['source']}] {e['ts']}  {preview}")
+    else:
+        print("    （无归档记录）")
+
+
 def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
     """处理斜杠命令。返回 (should_continue, new_session_or_none)。
     should_continue=False 表示退出主循环。
@@ -118,6 +160,9 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         if vals.get("review_rounds"):
             print(f"     评审轮数：{vals['review_rounds']}")
         return True, None
+    if cmd == "/context":
+        _cmd_context(sess, graph)
+        return True, None
     if cmd == "/graph":
         print(graph.get_graph().draw_ascii())
         return True, None
@@ -125,8 +170,11 @@ def handle_slash(cmd: str, sess: Session, graph) -> tuple[bool, Session | None]:
         print(agent._c(f"[蓝] ↩ {agent._undo_latest(sess.thread_id)}", agent._C.YELLOW))
         return True, None
     if cmd == "/retry":
-        if not agent.resume_pending(graph, sess):
-            print("[蓝] 没有可续的断点（上一轮已正常结束）。")
+        try:
+            if not agent.resume_pending(graph, sess):
+                print("[蓝] 没有可续的断点（上一轮已正常结束）。")
+        except agent.SessionBusyError as exc:
+            print(agent._c(f"[蓝] ⏳ {exc}", agent._C.YELLOW))
         return True, None
     if cmd == "/model" or cmd.startswith("/model "):
         _cmd_model(cmd[len("/model"):], sess)
@@ -420,13 +468,24 @@ def _print_node(node_name: str, output: dict) -> None:
 
 # ─────────────────────────── 主交互循环 ───────────────────────────
 
+def _safe_run_round(graph, sess: Session, request: str) -> None:
+    """run_round + 跨进程锁冲突兜底（M1）：会话正被另一端口执行时提示并继续。"""
+    import agent  # 惰性取用
+    try:
+        agent.run_round(graph, sess, request)
+    except agent.SessionBusyError as exc:
+        print(agent._c(
+            f"[蓝] ⏳ {exc}（直连模式与 Web 引擎互斥；在 Web 端操作，或等它跑完再试）",
+            agent._C.YELLOW))
+
+
 def run_interactive(graph, request: str | None = None, sess: Session | None = None) -> None:
     """多轮交互主循环：支持连续提需求 + 斜杠命令。"""
     import agent  # 惰性取用（避免循环导入）
     register_step_callback(_print_node)  # 默认回调：CLI 打印
     sess = sess or Session()
     if request:
-        agent.run_round(graph, sess, request)
+        _safe_run_round(graph, sess, request)
     print(_c(f"\n[蓝] 小蓝 Blue v{agent.BLUE_VERSION} —— 进入多轮模式。输入 /help 查看命令，直接输入需求继续干活。", _C.BLUE))
     while True:
         try:
@@ -443,7 +502,7 @@ def run_interactive(graph, request: str | None = None, sess: Session | None = No
             if new_sess is not None:
                 sess = new_sess
             continue
-        agent.run_round(graph, sess, line)
+        _safe_run_round(graph, sess, line)
 
 
 def _resume_picker(graph=None) -> str | None:

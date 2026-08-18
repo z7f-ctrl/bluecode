@@ -29,7 +29,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
 | `blue web` | 启动 Web 控制台（v0.8：对话 + 实时过程 + 逐条审批 + 会话管理；详见下节） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（40 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（45 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -134,7 +134,8 @@ bluecode/
 │   ├── events.py       # SSE 事件/环形缓冲/审批卡构造/结构化 diff
 │   ├── tests/smoke_web.py   # Web 后端冒烟（fake model 离线）
 │   └── static/         # 零构建单页：index.html + app.js/app.css
-├── validate_graph.py   # 离线功能验证（fake model，40 项，不需 API key）
+├── validate_graph.py   # 离线功能验证（fake model，45 项，不需 API key）
+├── webclient.py        # CLI 客户端模式（v0.8.x）：连接 Web 引擎执行，终端变第二视图
 ├── requirements.txt
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
@@ -151,10 +152,11 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 40 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 45 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
-# 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / final_answer 正文透传 / worker 容错 / token 追踪 /
-# executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
+# 安全加固 / 工具易用性 / 滑动窗口 / 滑动窗口活动任务保护 / report 模板化 /
+# final_answer 正文透传 / 压缩摘要落盘归档+快照轮转 / /context 可见性 / 跨进程执行锁 /
+# worker 容错 / token 追踪 / executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
 # LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 /
 # web 搜索与抓取（含 SSRF IPv6 变体）/ doctor 自检判定 / init 写配置 / 并行只读调用去重 /
 # 权限批次单次读配置 / grep 大文件跳过 / resume checkpoint 探测 / _command_head 优先级 /
@@ -162,9 +164,10 @@ bluecode/
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
 
-# Web 后端冒烟（v0.8，10 场景）：只读轮 / 写轮全链路（暂存→审批卡→详情→approve→真写入→
+# Web 后端冒烟（v0.8，12 场景）：只读轮 / 写轮全链路（暂存→审批卡→详情→approve→真写入→
 # 审计 source:web→SSE 重放）/ reject+选批 / 重启重建审批卡续跑 / retry / undo /
-# health 掩码+token 校验 / 415+非 loopback token 强制 / 结构化 diff / 跨会话事件不串扰
+# health 掩码+token 校验 / 415+非 loopback token 强制 / 结构化 diff / 跨会话事件不串扰 /
+# CLI 客户端模式（probe→建会话→发需求→SSE→快照一致）/ 跨进程锁 API 面（CLI 持锁时 Web 409）
 python web/tests/smoke_web.py
 # 期望输出：ALL WEB SMOKE TESTS PASSED ✅
 ```
@@ -221,7 +224,8 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 ## 已知限制
 
 - `astream_events` token 级流式输出未做，当前是节点级播报（已通过 step 回调机制解耦，可挂自定义 UI）。
-- agent/worker 工具循环内有滑动窗口（`AGENT_MSG_WINDOW=20`）：较早的工具交互会被压缩成摘要喂给后续调用，极端长任务里模型可能"忘记"早期细节（摘要保留了文件/改动/执行结果的要点）。
+- agent/worker 工具循环内有滑动窗口（`AGENT_MSG_WINDOW=20`）：较早的工具交互会被压缩成摘要喂给后续调用，极端长任务里模型可能"忘记"早期细节（摘要保留了文件/改动/执行结果的要点）。**活动任务保护**（v0.8.x）：最近 3 轮工具证据永不压缩（并行只读爆发时防止"刚读到的内容"被窗口挤出）。
+- 压缩摘要会落盘归档：跨轮/revise 摘要 append 到 `~/.blue/archives/<thread_id>.jsonl`（游标递增，每 20 条快照轮转保留 5 份），`/context` 可查压缩摘要 + 消息尾部 + 归档记录——压缩从"不可逆"变"可追溯"。
 - 只读/拒绝场景的交付报告是模板直出（不调 LLM），文风朴素；涉及实际改动的报告仍由 LLM 组织语言。
 - reviewer 每次任务要多轮 LLM 调用（通常 4~7 次），API 限流时体验会慢。
 - 会话元信息（`sessions` 表）与 LangGraph checkpoint 分开存储，极端情况下可能不一致（如手动删 checkpoint 文件）。
@@ -235,11 +239,18 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 > 给 hello.py 加错误处理
 ...（图执行 + 审批）...
 > /history       # 查看当前会话状态
+> /context       # 查看模型上下文构成（压缩摘要 + 消息尾部 + 归档记录）
 > /clear         # 开启新 thread，清空上下文
 > /quit          # 退出
 ```
 
-可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）`/model`（查看/切换模型）。
+可用命令：`/help` `/quit` `/exit` `/clear` `/new` `/history` `/context`（压缩可见性）`/graph` `/resume` `/undo` `/retry`（断点续跑上一轮未完成的执行）`/model`（查看/切换模型）。
+
+### CLI 与 Web 双向同步（v0.8.x）
+
+`blue web` 启动后，本机再运行交互式 `blue` 会自动进入**客户端模式**（`--local` 强制直连）：执行权归一 Web 引擎进程（单写者强一致），CLI 通过 REST/SSE 成为终端版第二视图——两边同时看到节点播报、都能发需求、都能审批（y/n/m/d → 投递决策）。客户端模式命令：`/sessions`（列出 Web 端会话）`/use N`（切换会话）`/new`（新会话）`/history` `/context` `/undo` `/retry` `/status`。显式指定引擎：`blue --connect http://127.0.0.1:8765 "需求"`（单发一轮即退出）；token 模式用 `--token` 或环境变量 `BLUE_WEB_TOKEN`。
+
+若 Web 未启动，CLI 回落直连；**同一会话直连双写者由跨进程执行锁互斥**（`exec_locks` 表，心跳 90s 过期自动接管）——CLI 直连执行时 Web 端操作该会话返回 409 并报持有方，反之亦然。
 
 ### 多模型管理与 /model 切换（v0.7.2）
 

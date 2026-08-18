@@ -279,7 +279,7 @@ idle → running(planner) → running(agent | workers×N) → awaiting_approval 
 |---|---|
 | 同一会话二连发 | 409 `round_running`；前端发送按钮运行中禁用 |
 | 不同会话并行 | 默认全局串行队列（执行器互斥）；`--concurrency N` 放开（benchmark 多进程已证 sqlite WAL 可承受，谨慎起步） |
-| Web 与 CLI 同会话 | v1 明确不支持（文档 + README 提示）；冲突高频再上 sessions 表 owner 租约 |
+| Web 与 CLI 同会话 | **v0.8.x 已落地**：① 跨进程执行锁（`exec_locks` 表，holder/pid/心跳，90s 过期接管）——直连双写者互斥，冲突 409 `session_busy` 报持有方；② CLI 客户端模式（`webclient.py`）——CLI 探测到 Web 引擎后自动变客户端（`--local` 强制直连），执行权归一 Web 引擎，CLI 经 REST/SSE 成为第二视图，单写者强一致（§8 旧「约定禁止」升级为此机制） |
 | SSE 断线 | 浏览器 EventSource 自动重连 + Last-Event-ID；服务端每会话环形缓冲（最近 500 事件）重放 |
 | 服务重启 | 会话/checkpoint/审计全在 `~/.blue` 落盘，无损；挂起中的审批由 `GET session` 的 interrupts 重建；内存中的 `Session.token_usage` 清零（与 CLI 重启同语义） |
 | web_drain 等待中进程被杀 | 同上——interrupt 态持久，无丢失；at-least-once 语义与 CLI `/retry` 完全一致 |
@@ -370,7 +370,7 @@ web/
 | 3 | 超大 diff / 超长报告卡顿 | 预览+懒加载（§4.2 裁剪规则）+ 虚拟滚动；本地单用户，实际上限可控 |
 | 4 | `Session.token_usage` 内存态、重启清零 | 与 CLI 同语义，文档标注；不为此改存储 |
 | 5 | pipx 安装后静态资源漏打包 | M0 就用 `pipx install .` 验 package-data，不留到最后 |
-| 6 | CLI 与 Web 同会话并发操作 | v1 约定禁止（§8）；观察实际使用频率再决定是否上租约 |
+| 6 | CLI 与 Web 同会话并发操作 | v0.8.x 已解决：跨进程执行锁互斥直连双写者 + CLI 客户端模式归一单写者（§8）；锁崩溃残留靠 90s 心跳过期接管 |
 | 7 | `_run_graph_core`/guard 的 print 混入服务日志 | v1 接受（当镜像日志看）；嘈杂再加大字段静音开关 |
 | 8 | Safari 对 SSE 的连接数限制（6 个/域） | 单会话单连接 + 页面唯一，不触界；文档备注 |
 

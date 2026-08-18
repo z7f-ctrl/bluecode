@@ -80,7 +80,7 @@ from tools import (
 )
 # 目录常量来自 session（#7 模块拆分）；这里尽早导入供本模块模块级常量定义使用。
 from session import (
-    BLUE_DIR, DB_PATH, AUDIT_LOG, BACKUP_ROOT, ENV_GLOBAL_PATH,
+    BLUE_DIR, DB_PATH, AUDIT_LOG, BACKUP_ROOT, ENV_GLOBAL_PATH, ARCHIVE_DIR,
 )
 
 MAX_REVIEW_ROUNDS = 3
@@ -88,7 +88,10 @@ MAX_TOOL_ITERATIONS = 15
 MAX_WORKER_ITERATIONS = 8   # 并行 worker 的工具循环上限（比串行 agent 小，防限流下耗时失控）
 MAX_PARALLEL_WORKERS = 4    # 并行 worker 数量上限（实测 API 限流，不宜更高）
 RESUME_STREAM_TIMEOUT = 60.0  # /retry 断点续跑的墙钟超时（秒）：节点崩溃后续跑可能永不返回（忙等占满 CPU），靠超时熔断
-# 目录常量（BLUE_DIR/DB_PATH/AUDIT_LOG/BACKUP_ROOT/ENV_GLOBAL_PATH）已迁至 session.py，
+ARCHIVE_SNAPSHOT_EVERY = 20  # archive.jsonl 每追加 N 条做一次快照（轻量版本化）
+ARCHIVE_KEEP_SNAPSHOTS = 5   # 快照保留份数（超出删最旧，防无限膨胀）
+AGENT_PROTECT_ROUNDS = 3     # 滑动窗口活动任务保护：最近 N 轮工具证据永不压缩
+# 目录常量（BLUE_DIR/DB_PATH/AUDIT_LOG/BACKUP_ROOT/ENV_GLOBAL_PATH/ARCHIVE_DIR）已迁至 session.py，
 # 经文件末尾 `from session import *` 重导出，保持 agent.X 可访问（测试 patch 用）。
 
 
@@ -387,8 +390,10 @@ def planner(state: AgentState) -> dict:
     ) > HISTORY_MAX_CHARS:
         old = history[:-1]
         removals = [RemoveMessage(id=m.id) for m in old if getattr(m, "id", None)]
-        summary = HumanMessage(
-            content=f"【历史会话摘要】\n{_compress_messages(old, state['request'])}")
+        compressed = _compress_messages(old, state["request"])
+        # 摘要落盘归档：跨轮压缩是"不可逆"的隐形操作，落盘后可追溯/回看（/context）
+        _append_archive(state.get("thread_id", ""), "cross_round", compressed)
+        summary = HumanMessage(content=f"【历史会话摘要】\n{compressed}")
         update["messages"] = removals + [summary]
         history = [summary] + history[-1:]
     # 有历史时 planner 带上历史段（指代连贯性："它/那个文件"靠这个解析）；
@@ -721,6 +726,80 @@ def guard(state: AgentState) -> dict:
             "executed_changes": ordered, "changed_files": changed_files}
 
 
+_archive_cursor: dict[str, int] = {}  # 进程内归档游标缓存（thread_id -> 下一条游标）
+
+
+def _append_archive(thread_id: str, source: str, summary: str) -> None:
+    """压缩摘要落盘 archive.jsonl（append-only、游标递增）+ 每 N 条快照轮转。
+
+    定位：跨轮压缩/revise 摘要从"只活在 messages 里、不可追溯"升级为"落盘可查"
+    （nanobot 的 Consolidator 思想）。best-effort：任何失败都吞掉，绝不阻断主流程。
+    """
+    try:
+        if not thread_id or not summary:
+            return
+        cursor = _archive_cursor.get(thread_id)
+        if cursor is None:
+            path = os.path.join(ARCHIVE_DIR, f"{thread_id}.jsonl")
+            cursor = 1
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                cursor = int(json.loads(line)["cursor"]) + 1
+                except Exception:
+                    cursor = 1
+            _archive_cursor[thread_id] = cursor
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        record = {
+            "cursor": cursor, "ts": datetime.now().isoformat(timespec="seconds"),
+            "thread_id": thread_id, "source": source, "summary": summary,
+        }
+        with open(os.path.join(ARCHIVE_DIR, f"{thread_id}.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _archive_cursor[thread_id] = cursor + 1
+        if cursor % ARCHIVE_SNAPSHOT_EVERY == 0:
+            _snapshot_archive(thread_id, cursor)
+    except Exception:
+        pass  # 归档是辅助设施，失败不影响主流程
+
+
+def _snapshot_archive(thread_id: str, cursor: int) -> None:
+    """快照轮转：每 ARCHIVE_SNAPSHOT_EVERY 条把当前 archive 复制到 backups/，
+    保留最近 ARCHIVE_KEEP_SNAPSHOTS 份（nanobot GitStore 的免 git 轻量替代）。"""
+    try:
+        snap_dir = os.path.join(ARCHIVE_DIR, "backups")
+        os.makedirs(snap_dir, exist_ok=True)
+        src = os.path.join(ARCHIVE_DIR, f"{thread_id}.jsonl")
+        dst = os.path.join(snap_dir, f"{thread_id}-{cursor}.jsonl")
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+        snaps = sorted(
+            (p for p in os.listdir(snap_dir)
+             if p.startswith(thread_id + "-") and p.endswith(".jsonl")),
+            key=lambda p: int(p.rsplit("-", 1)[1].split(".")[0]),
+        )
+        for old in snaps[:-ARCHIVE_KEEP_SNAPSHOTS]:
+            os.unlink(os.path.join(snap_dir, old))
+    except Exception:
+        pass
+
+
+def read_archive(thread_id: str, n: int = 5) -> list[dict]:
+    """读最近 n 条 archive 记录（/context 展示用；文件缺失/损坏返回空列表）。"""
+    path = os.path.join(ARCHIVE_DIR, f"{thread_id}.jsonl")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        return lines[-n:]
+    except Exception:
+        return []
+
+
 def _compress_messages(messages: list, request: str) -> str:
     """把 agent 的完整工具历史压缩成一段人可读摘要，供 revise 回环时替代原始消息。
 
@@ -804,9 +883,13 @@ def _sliding_compress(messages: list, head_len: int, request: str) -> list:
             groups[-1].append(m)
         else:
             groups.append([m])
-    # 切掉最早若干组，直到覆盖 overflow
+    # 切掉最早若干组，直到覆盖 overflow；活动任务保护：最近 AGENT_PROTECT_ROUNDS
+    # 轮（当前工具突发的证据）永不压缩——并行只读爆发（一条 AI 带多个 tool_calls）
+    # 会让单轮消息数膨胀、窗口内保留轮数变少，把正在使用的最近几轮也压掉会丢
+    # "刚读到的文件内容"（nanobot auto-compact 跳过活动任务的同款思路）。
+    max_cut = max(len(groups) - AGENT_PROTECT_ROUNDS, 0)
     cut, gi = 0, 0
-    while gi < len(groups) and cut < overflow:
+    while gi < max_cut and cut < overflow:
         cut += len(groups[gi])
         gi += 1
     if gi == 0:
@@ -972,6 +1055,8 @@ def reviewer(state: AgentState) -> dict:
     update: dict = {"verdict": new_verdict, "feedback": text, "review_rounds": new_rounds}
     if new_verdict == "revise":
         compressed = _compress_messages(state.get("messages", []), state["request"])
+        # 摘要落盘归档（revise 回环压缩同样不可逆，归档后 /context 可查）
+        _append_archive(state.get("thread_id", ""), "revise", compressed)
         # 逐条 RemoveMessage 删除旧历史，再追加单条摘要
         removals = [RemoveMessage(id=m.id) for m in state.get("messages", []) if m.id]
         update["messages"] = removals + [HumanMessage(content=f"【上一轮执行摘要】\n{compressed}")]
@@ -1303,7 +1388,7 @@ def _drain(graph, config: dict, sess: Session) -> None:
                         _emit_step(node_name, output)
 
 
-def resume_pending(graph, sess: Session, drain=_drain) -> bool:
+def resume_pending(graph, sess: Session, drain=_drain, holder: str = "cli") -> bool:
     """/retry 断点续跑：当前 thread 的 checkpoint 有未完成的业务，就从停下的地方继续。
 
     drain 可注入（默认 CLI 的 _drain）：Web 控制台传 web_drain 让审批走浏览器。
@@ -1321,6 +1406,14 @@ def resume_pending(graph, sess: Session, drain=_drain) -> bool:
     也不推进，单次 stream 调用卡死数小时占满 CPU）。故单次续跑套墙钟超时，超时即
     熔断返回、绝不忙等；正常续跑停在 guard interrupt 后交给 _drain 审批。
     """
+    # M1 跨进程执行锁（v0.8.x）：续跑同样占用会话（含审批等待期）。跨进程同会话
+    # 并发续跑会互相覆盖 checkpoint——锁内串行；锁冲突抛 SessionBusyError 给调用方。
+    with exec_lock(sess.thread_id, holder):
+        return _resume_pending_locked(graph, sess, drain)
+
+
+def _resume_pending_locked(graph, sess: Session, drain=_drain) -> bool:
+    """resume_pending 的锁内主体（原逻辑不变）。"""
     cur = graph.get_state(sess.config)
     if not cur or not cur.next:
         return False
@@ -1375,13 +1468,17 @@ def resume_pending(graph, sess: Session, drain=_drain) -> bool:
     return True
 
 
-def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain) -> None:
+def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain,
+                    holder: str = "cli") -> None:
     """run_round / run_round_auto 共享的一轮执行骨架（消除两处重复的前 10 行）。
 
-    持有：initial_state 组装 → thread_id → messages 注入需求（多轮连贯基础）
-    → token 重置 → 打印 → graph.stream（异常兜底）→ drain（审批策略注入）
-    → token 播报 → 会话元信息落库。差异仅审批环节：drain 回调封装不同审批
-    策略（人工 input / 自动 approve）。
+    持有：跨进程执行锁（M1，v0.8.x）→ initial_state 组装 → thread_id → messages
+    注入需求（多轮连贯基础）→ token 重置 → 打印 → graph.stream（异常兜底）
+    → drain（审批策略注入）→ token 播报 → 会话元信息落库。差异仅审批环节：
+    drain 回调封装不同审批策略（人工 input / 自动 approve / Web 桥）。
+
+    holder 区分执行来源（cli / bench / web）：同进程内重入无害（锁可重入），
+    跨进程同会话并发执行由锁拦下（SessionBusyError 抛给调用方处理）。
     """
     config = sess.config
     state = initial_state(request)
@@ -1391,17 +1488,18 @@ def _run_graph_core(graph, sess: Session, request: str, *, banner: str, drain) -
     state["messages"] = [HumanMessage(content=request)]
     _reset_token_usage()
     print(banner)
-    try:
-        for chunk in graph.stream(state, config=config, stream_mode="updates"):
-            for node_name, output in chunk.items():
-                _emit_step(node_name, output)
-    except Exception:
-        traceback.print_exc()
-        _node_logger().exception("图执行异常（thread=%s）", sess.thread_id)
-        print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
-    drain(graph, config, sess)
-    _finish_round_usage(sess)
-    _save_session_meta(sess)
+    with exec_lock(sess.thread_id, holder):
+        try:
+            for chunk in graph.stream(state, config=config, stream_mode="updates"):
+                for node_name, output in chunk.items():
+                    _emit_step(node_name, output)
+        except Exception:
+            traceback.print_exc()
+            _node_logger().exception("图执行异常（thread=%s）", sess.thread_id)
+            print(_c("[蓝] ⚠ 本轮执行中断，可用 /retry 从断点继续。", _C.RED))
+        drain(graph, config, sess)
+        _finish_round_usage(sess)
+        _save_session_meta(sess)
 
 
 def run_round(graph, sess: Session, request: str) -> None:
@@ -1440,7 +1538,35 @@ def main() -> None:
     parser.add_argument("--show-graph", action="store_true", help="打印图拓扑后退出")
     parser.add_argument("--resume", action="store_true", help="恢复历史会话")
     parser.add_argument("--auto-approve", action="store_true", help="benchmark 模式：guard 自动审批通过，不中断等待人工")
+    parser.add_argument("--connect", default=None, metavar="URL",
+                        help="连接运行中的 Web 控制台执行（客户端模式，执行权在 Web 引擎进程；"
+                             "默认自动探测本机 8765，--local 跳过）")
+    parser.add_argument("--local", action="store_true",
+                        help="强制本地直连执行（跳过本机 Web 引擎探测）")
+    parser.add_argument("--token", default=None,
+                        help="客户端模式访问 Web 的 Bearer token（或环境变量 BLUE_WEB_TOKEN；loopback 模式不需要）")
     args = parser.parse_args()
+
+    # 客户端模式（M2，v0.8.x）：执行权在 Web 引擎进程，CLI 只做输入/事件/审批桥，
+    # 两边天然同步（同一事件源）。触发：显式 --connect；或交互式（无 request/
+    # resume/auto-approve）且本机 web 在跑且未 --local——「打开 Web 页面后继续在
+    # CLI 操作」的默认行为。探测失败静默回落直连，体验与旧版一致。
+    web_base = args.connect
+    if web_base is None and not (args.local or args.request or args.resume
+                                 or args.auto_approve or args.show_graph):
+        from webclient import probe_web
+        health = probe_web()
+        if health is not None:
+            web_base = "http://127.0.0.1:8765"
+            print(_c(f"[蓝] 检测到 Web 控制台（v{health.get('version', '')}），进入客户端模式；"
+                     f"用 --local 可强制直连。", _C.BLUE))
+    if web_base is not None:
+        if args.auto_approve:
+            parser.error("--connect 与 --auto-approve 不能同时使用（客户端模式执行权在 Web 引擎）")
+        if args.resume:
+            print(_c("[蓝] --resume 在客户端模式不适用：用 /sessions 查看、/use 切换会话。", _C.YELLOW))
+        from webclient import run_client
+        sys.exit(run_client(web_base, args.token, request=args.request))
 
     _setup_file_logging()
     graph = build_graph()
@@ -1454,7 +1580,10 @@ def main() -> None:
             cur = graph.get_state(sess.config)
             if cur and cur.next:
                 # 找回的会话有一轮没跑完：断点续跑（等价 /retry），而非开新一轮
-                resume_pending(graph, sess)
+                try:
+                    resume_pending(graph, sess)
+                except SessionBusyError as exc:
+                    print(_c(f"[蓝] ⏳ {exc}", _C.YELLOW))
             else:
                 print(f"[蓝] 恢复 thread {tid}，上轮已完成。输入新需求继续。")
             run_interactive(graph, sess=sess)
@@ -1493,7 +1622,7 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
                             _emit_step(node_name, output)
 
     banner = _c(f"[蓝] ★ benchmark 模式收到：{request}", _C.BLUE)
-    _run_graph_core(graph, sess, request, banner=banner, drain=_auto_drain)
+    _run_graph_core(graph, sess, request, banner=banner, drain=_auto_drain, holder="bench")
     return graph.get_state(sess.config).values
 
 
@@ -1504,6 +1633,8 @@ def run_round_auto(graph, sess: Session, request: str) -> dict:
 from session import (  # noqa: E402,F401
     BLUE_DIR, DB_PATH, AUDIT_LOG, BACKUP_ROOT, ENV_GLOBAL_PATH,
     Session, _ensure_blue_dir, _get_conn, _save_session_meta, list_sessions,
+    SessionBusyError, peek_exec_lock, acquire_exec_lock, heartbeat_exec_lock,
+    release_exec_lock, exec_lock, LOCK_STALE_SECONDS, LOCK_HEARTBEAT_INTERVAL,
 )
 from cli import (  # noqa: E402,F401
     _C, _c, _prompt, SLASH_HELP, handle_slash, register_step_callback,
