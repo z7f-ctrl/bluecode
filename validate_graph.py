@@ -555,6 +555,33 @@ def test_report_template_saves_llm():
     print("PASS report template（只读场景零 LLM 调用 + last_ai 答复保留）✔\n")
 
 
+def test_final_answer_document_passthrough():
+    """纯信息/文档类任务：final_answer 完整正文必须原样进交付报告，不得压缩/截断。
+
+    回归背景：AGENT_PROMPT 曾把 final_answer 钉成"一句话总结"，模型照做后知识性
+    需求（"给一份详解"）只输出概述、正文全丢——正文是被提示词掐掉的。修复：提示词
+    区分任务类型（信息类正文进 answer）+ state.final_answer 字段直出报告。断言正文
+    中段与结尾标记都在，证明无截断。"""
+    doc = "## 背景\n" + "正文段落。\n" * 50 \
+        + "## 中段标记 __DOC_MIDDLE__\n" + "细节。\n" * 50 \
+        + "## 结尾 __DOC_END__\n"
+    calls = [
+        AIMessage(content='["读"]'),                        # planner
+        AIMessage(content="输出正文", tool_calls=[           # agent：直接 final_answer 交付全文
+            {"name": "final_answer", "args": {"answer": doc}, "id": "fa1"}]),
+        AIMessage(content="verdict: pass\nfeedback: 只读无需评审"),  # reviewer proceed 短路（不消耗）
+    ]
+    fake = FakeModel(calls)
+    order, state = run_on(fake, "给一份 Context Compaction 详解文档")
+    fb = state["feedback"]
+    assert fb.startswith("# 交付报告"), "信息类任务应走模板报告"
+    assert state.get("final_answer") == doc, "final_answer 全文应写入 state"
+    assert "__DOC_MIDDLE__" in fb and "__DOC_END__" in fb, \
+        "正文中段/结尾必须完整保留——只给开头概述即视为正文丢失"
+    assert "本次为只读任务" in fb
+    print("PASS final_answer 正文完整透传（信息类任务不丢正文）✔\n")
+
+
 def test_worker_fault_tolerance():
     """并行 worker 单点失败不拖垮整图：失败降级为 note，兄弟 worker 成果保留。"""
     alpha, beta = "__scratch_ft_alpha__.txt", "__scratch_ft_beta__.txt"
@@ -1499,6 +1526,7 @@ if __name__ == "__main__":
         test_tool_usability()
         test_agent_sliding_window()
         test_report_template_saves_llm()
+        test_final_answer_document_passthrough()
         test_worker_fault_tolerance()
         test_token_usage_tracking()
         test_report_gets_executed_changes()

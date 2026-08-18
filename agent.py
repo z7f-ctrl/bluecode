@@ -116,6 +116,7 @@ class AgentState(TypedDict):
     worker_notes: Annotated[list[str], _resettable_add]  # 各 worker 的一句话总结，聚合
     executed_changes: list[dict]     # guard 执行通过后留存的完整改动（reviewer 看 diff、report 列清单；pending_changes 审批后即清空，不能用）
     changed_files: list[str]         # guard 写入的改动文件列表（verifier 读，替代【改动文件】文本协议）
+    final_answer: str                # agent 的最终答复全文（纯信息/文档类任务的交付正文，report 直出）
 
 
 def initial_state(request: str) -> AgentState:
@@ -134,6 +135,7 @@ def initial_state(request: str) -> AgentState:
         "worker_notes": [],
         "executed_changes": [],
         "changed_files": [],
+        "final_answer": "",
     }
 
 
@@ -571,9 +573,10 @@ def agent(state: AgentState) -> dict:
         for tm in tool_messages:
             messages.append(tm)
             updated.append(tm)
-        # 把 final_answer 内容提炼成一条 AIMessage，作为本轮收尾
+        # 把 final_answer 内容提炼成一条 AIMessage，作为本轮收尾；全文进 state 供 report 直出
         updated.append(AIMessage(content=args.get("answer", "")))
-        return {"messages": updated, "pending_changes": pending, "current_step": step}
+        return {"messages": updated, "pending_changes": pending, "current_step": step,
+                "final_answer": args.get("answer", "")}
 
     def _finalize(pending, hit_cap) -> dict:
         # 计划步只在一批改动攒出（即将进入审批）时推进一次：
@@ -980,12 +983,16 @@ def report(state: AgentState) -> dict:
     # 只读 / 拒绝场景模板化，省一次 LLM 调用（~2000 token）。
     # 特征串与 reviewer 固定文案耦合（guard-verifier 的【改动文件】同类约定），改文案两边同步。
     if "本次为只读任务" in fb:
-        last_ai = next(
-            (m.content for m in reversed(state.get("messages", []))
-             if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
-            "",
-        )
-        body = f"本次为只读任务，未做任何改动。\n\n**答复**：{last_ai}" if last_ai else "本次为只读任务，未做任何改动。"
+        # 纯信息/文档类任务的交付正文：优先 final_answer 全文（提示词已要求正文不截断），
+        # 兜底取 messages 尾部 last_ai（旧 checkpoint 无 final_answer 字段时兼容）。
+        answer = (state.get("final_answer") or "").strip()
+        if not answer:
+            answer = next(
+                (m.content for m in reversed(state.get("messages", []))
+                 if isinstance(m, AIMessage) and isinstance(m.content, str) and m.content.strip()),
+                "",
+            )
+        body = f"本次为只读任务，未做任何改动。\n\n**答复**：{answer}" if answer else "本次为只读任务，未做任何改动。"
         return {"feedback": f"# 交付报告\n\n{body}"}
     if "（用户已拒绝）" in fb:
         return {"feedback": "# 交付报告\n\n改动未通过审批，未执行任何操作。"}
@@ -998,7 +1005,8 @@ def report(state: AgentState) -> dict:
                     f"用户需求：{state['request']}\n"
                     f"最终改动清单：\n{_summarize_changes_for_review(state.get('executed_changes', []))}\n"
                     f"评审轮数：{state.get('review_rounds', 0)}\n"
-                    f"执行/测试结果：{state.get('feedback', '(无)')}"
+                    f"执行/测试结果：{state.get('feedback', '(无)')}\n"
+                    f"agent 最终答复：{state.get('final_answer') or '(无)'}"
                 )
             ),
         ],

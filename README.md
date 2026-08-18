@@ -29,7 +29,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
 | `blue web` | 启动 Web 控制台（v0.8：对话 + 实时过程 + 逐条审批 + 会话管理；详见下节） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
-| `python validate_graph.py` | 离线功能验证（39 项，不需要 API key） |
+| `python validate_graph.py` | 离线功能验证（40 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
 | `python agent.py "需求" --auto-approve` | benchmark 模式：guard 自动审批，不中断（CI/评测用） |
 | `python agent.py --resume` | 列出历史会话并恢复 |
@@ -134,7 +134,7 @@ bluecode/
 │   ├── events.py       # SSE 事件/环形缓冲/审批卡构造/结构化 diff
 │   ├── tests/smoke_web.py   # Web 后端冒烟（fake model 离线）
 │   └── static/         # 零构建单页：index.html + app.js/app.css
-├── validate_graph.py   # 离线功能验证（fake model，39 项，不需 API key）
+├── validate_graph.py   # 离线功能验证（fake model，40 项，不需 API key）
 ├── requirements.txt
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
@@ -151,9 +151,9 @@ bluecode/
 ## 验证
 
 ```bash
-# 离线 39 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
+# 离线 40 项验证：只读 / 写+审批 / 拒绝 / revise 回边 / cwd 越界双路径 /
 # 多轮会话 / 会话元信息持久化 / revise 消息压缩 / planner 跳过 / 并行 worker 扇出 /
-# 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / worker 容错 / token 追踪 /
+# 安全加固 / 工具易用性 / 滑动窗口 / report 模板化 / final_answer 正文透传 / worker 容错 / token 追踪 /
 # executed_changes 留存 / 审计日志 / 逐条审批 / undo 快照回退 /
 # LLM 自动重试 / /retry 断点续跑 / 权限 allow 直批 / 权限 deny / 执行顺序 / 跨轮上下文连贯 /
 # web 搜索与抓取（含 SSRF IPv6 变体）/ doctor 自检判定 / init 写配置 / 并行只读调用去重 /
