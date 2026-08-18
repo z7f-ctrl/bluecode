@@ -282,6 +282,11 @@ def _preview_lines(text: str, n: int = 5) -> str:
     return "\n".join(lines[:n]) + f"\n  …（共 {len(lines)} 行，按 d 查看全文）"
 
 
+# v0.8 Web 控制台复用的公开别名（裁剪 pending/快照展示，与 CLI 预览规则保持一致）
+shown_change = _shown_change
+preview_lines = _preview_lines
+
+
 def _print_change_approval(ci: int, ch: dict) -> None:
     """审批列表的单条改动：给内容预览而非只有长度——审批是安全底线，
     只看 content_len=N 就按 y 等于闭眼放行。"""

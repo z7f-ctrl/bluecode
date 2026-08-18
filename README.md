@@ -8,7 +8,7 @@
 
 ```bash
 # 方式一（推荐，v0.7 起）：pipx 安装为全局命令
-pipx install .
+pipx install '.[web]'   # [web] = 可选 Web 控制台（v0.8，需 fastapi/uvicorn）
 blue init       # 交互式配置（key 不回显，写 ~/.blue/.env，任意目录可用）
 blue doctor     # 自检：环境/依赖/配置/API 可达/模型存在/tool calling
 blue "给 hello.py 加上错误处理，并写一个 pytest 测试"
@@ -27,6 +27,7 @@ python agent.py "给 hello.py 加上错误处理，并写一个 pytest 测试"
 | 命令 | 作用 |
 |---|---|
 | `blue init` / `blue doctor` | 初始化配置 / 自检（v0.7 起；源码直跑用 `python agent.py init` 等效） |
+| `blue web` | 启动 Web 控制台（v0.8：对话 + 实时过程 + 逐条审批 + 会话管理；详见下节） |
 | `python agent.py --show-graph` | 打印图拓扑（`grandalf` 提供 ASCII 渲染） |
 | `python validate_graph.py` | 离线功能验证（39 项，不需要 API key） |
 | `python agent.py "需求"` | 跑一个需求（交互式，需 API key） |
@@ -126,7 +127,13 @@ bluecode/
 ├── tools.py            # 10 工具 + 安全校验（命令/Python 双路径 + .blue.toml 权限分级）
 ├── prompts.py          # planner / agent / worker / reviewer / report 提示词（文案集中）
 ├── pyproject.toml      # 打包配置（console_scripts：blue = agent:main）
-├── validate_graph.py   # 离线功能验证（fake model，32 项，不需 API key）
+├── web/                # Web 控制台（v0.8）：FastAPI + SSE 后端 + 零构建前端
+│   ├── server.py       # REST/SSE 路由、token 安全（非 loopback 强制）、启动入口
+│   ├── executor.py     # 会话执行器 + web_drain 审批桥
+│   ├── events.py       # SSE 事件/环形缓冲/审批卡构造/结构化 diff
+│   ├── tests/smoke_web.py   # Web 后端冒烟（fake model 离线）
+│   └── static/         # 零构建单页：index.html + app.js/app.css
+├── validate_graph.py   # 离线功能验证（fake model，39 项，不需 API key）
 ├── requirements.txt
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
@@ -153,6 +160,12 @@ bluecode/
 # 模型注册表切换 / 上下文占用显示 / /model 斜杠命令 / run_round_auto 自动回归
 python validate_graph.py
 # 期望输出：ALL OFFLINE TESTS PASSED ✅
+
+# Web 后端冒烟（v0.8，10 场景）：只读轮 / 写轮全链路（暂存→审批卡→详情→approve→真写入→
+# 审计 source:web→SSE 重放）/ reject+选批 / 重启重建审批卡续跑 / retry / undo /
+# health 掩码+token 校验 / 415+非 loopback token 强制 / 结构化 diff / 跨会话事件不串扰
+python web/tests/smoke_web.py
+# 期望输出：ALL WEB SMOKE TESTS PASSED ✅
 ```
 
 真机验证需要 API key（见「快速开始」）。真实模型会触发 revise 回边和 interrupt 审批——这是设计意图，不是 bug。
@@ -189,10 +202,10 @@ python3 benchmarks/quixbugs/run_benchmark.py --workers 4  # 并行跑题
 | v0.7.1 | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
 | v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
 | v0.7.3 | benchmark 双判据：FAIL_TO_PASS/PASS_TO_PASS（报告区分「未修复」与「修坏回归」，为 BugsInPy 铺判据基础设施） | ✅ 已实现 |
-| v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | 设计稿就绪 |
-| v0.9 | BugsInPy pilot（5–10 题轻依赖，独立 venv，双判据判分；验证 Python 3.14 环境可行性后定扩量） | 未实现 |
-| v0.10 | Web 观测增强：图小地图 / token 面板 / 审计尾部（M3）+ 模型切换器 / benchmark 结果查看器（M4 可选） | 未实现 |
-| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量（v0.9 pilot 后定） | 暂缓 |
+| v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | ✅ 已实现 |
+| v0.8.1 | BugsInPy pilot（5–10 题轻依赖，独立 venv，双判据判分；验证 Python 3.14 环境可行性后定扩量） | 未实现 |
+| v0.8.2| Web 观测增强：图小地图 / token 面板 / 审计尾部（M3）+ 模型切换器 / benchmark 结果查看器（M4 可选） | 未实现 |
+| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量 | 暂缓 |
 
 > LangGraph Studio 已从 backlog 关闭：v0.8 的图小地图 + 事件流满足其约 80% 需求，不再单独集成。
 
@@ -273,6 +286,24 @@ name = "gpt4o"            # 默认激活；可被 MODEL_NAME 或 /model 切换�
 每轮需求结束自动播报本轮 token 消耗（区分输入/输出，附模型名与调用次数）与会话累计；`/history` 可查看会话累计。单次调用明细（usage/耗时/全文）见 `BLUE_LOG_LLM=1` 的 LLM 日志。
 
 会话状态持久化到 `~/.blue/checkpoints.sqlite`；`--resume` 或交互中的 `/resume` 可恢复历史 thread。
+
+## Web 控制台（v0.8）
+
+`blue web` 启动浏览器控制台（FastAPI + SSE 后端 + 零构建单页，随包分发，无 Node 工具链）：
+
+```bash
+blue web                  # 仅本机：自动打开浏览器 http://127.0.0.1:8765
+blue web --host 0.0.0.0   # 局域网：强制 token——缺省自动生成随机 token 打印（Jupyter 式），
+                          # 也可 --token <值> 或环境变量 BLUE_WEB_TOKEN 固定
+```
+
+- 三区布局：会话侧栏（新建 / undo / retry）｜对话流（计划、执行过程、审批卡、验证、评审、报告）｜状态行。
+- 审批与 CLI 同语义：全部批准 / 全部拒绝 / 退回修改 / 逐条勾选（选批）/ 展开 diff（patch 红绿、行号对齐）；
+  预览规则与 CLI 一致（write 前 5 行、patch old/new 前 3 行、python 前 10 行、命令全文）。
+- 安全：默认只绑 `127.0.0.1`；token 模式所有 `/api` 校验 Bearer；**不提供 auto-approve 端点**——
+  SSE 断开/服务重启后挂起审批原样重现，绝不自动放行；模型输出与文件内容一律纯文本渲染（无 HTML 注入面）。
+- 断线自动重连（Last-Event-ID 从每会话环形缓冲重放）；服务重启后挂起的审批由会话快照自动重建。
+- 协议、事件类型与验收标准见 `design-web.md`。
 
 ## 扩展：step 回调
 

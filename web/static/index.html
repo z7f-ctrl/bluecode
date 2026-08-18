@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小蓝 Blue · Web 控制台</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<aside id="sidebar">
+  <div class="brand">
+    <span class="logo">小蓝 Blue</span>
+    <span id="health-badge" class="health" title="health 加载中…">
+      <span class="dot unk"></span><span class="model">…</span>
+    </span>
+    <span id="sse-dot" class="dot unk" title="SSE 事件流"></span>
+  </div>
+
+  <button id="btn-new" class="btn primary block">＋ 新会话</button>
+
+  <div id="session-list" class="session-list"></div>
+
+  <div class="sidebar-foot">
+    <div class="foot-row">
+      <button id="btn-undo" class="btn" disabled>↩ 撤销本轮</button>
+      <button id="btn-retry" class="btn" disabled>🔁 断点续跑</button>
+    </div>
+    <div id="status-line" class="status-line dim">空闲</div>
+  </div>
+</aside>
+
+<main id="main">
+  <div id="stream" class="stream"></div>
+
+  <div id="composer" class="composer">
+    <textarea id="input" rows="2"
+      placeholder="描述你的需求…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="btn-send" class="btn primary" disabled>发送</button>
+  </div>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

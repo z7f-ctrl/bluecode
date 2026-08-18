@@ -1287,8 +1287,10 @@ def _drain(graph, config: dict, sess: Session) -> None:
                         _emit_step(node_name, output)
 
 
-def resume_pending(graph, sess: Session) -> bool:
+def resume_pending(graph, sess: Session, drain=_drain) -> bool:
     """/retry 断点续跑：当前 thread 的 checkpoint 有未完成的业务，就从停下的地方继续。
+
+    drain 可注入（默认 CLI 的 _drain）：Web 控制台传 web_drain 让审批走浏览器。
 
     统一覆盖三场景：①进程内图执行异常中断；②进程重启后 --resume 找回会话发现
     有一轮没跑完；③死在 guard interrupt 审批点（续跑 = 重新弹出审批提示）。
@@ -1351,7 +1353,7 @@ def resume_pending(graph, sess: Session) -> bool:
         if err:
             traceback.print_exception(type(err[0]), err[0], err[0].__traceback__)
             _node_logger().exception("resume_pending 续跑异常（thread=%s）", sess.thread_id)
-    _drain(graph, sess.config, sess)
+    drain(graph, sess.config, sess)
     _finish_round_usage(sess)
     _save_session_meta(sess)
     return True
@@ -1406,8 +1408,17 @@ def main() -> None:
         sys.exit(cmd_init())
     if sys.argv[1:2] == ["doctor"]:
         sys.exit(cmd_doctor())
+    if sys.argv[1:2] == ["web"]:
+        # v0.8 Web 控制台：FastAPI + SSE（依赖为可选 extras：pip install bluecode[web]）
+        try:
+            from web.server import main as web_main
+        except ImportError:
+            print("[蓝] Web 控制台依赖未安装：pip install bluecode[web]"
+                  "（或 pip install fastapi uvicorn）")
+            sys.exit(1)
+        sys.exit(web_main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description="小蓝 Blue —— 本地个人 coding agent")
-    parser.add_argument("request", nargs="?", default=None, help='要做的事，例如 "给 hello.py 加错误处理并写测试"；子命令：init / doctor')
+    parser.add_argument("request", nargs="?", default=None, help='要做的事，例如 "给 hello.py 加错误处理并写测试"；子命令：init / doctor / web')
     parser.add_argument("--show-graph", action="store_true", help="打印图拓扑后退出")
     parser.add_argument("--resume", action="store_true", help="恢复历史会话")
     parser.add_argument("--auto-approve", action="store_true", help="benchmark 模式：guard 自动审批通过，不中断等待人工")
