@@ -4,6 +4,8 @@
 
 基于 [LangGraph](https://github.com/langchain-ai/langgraph) 实现，核心逻辑全部手写、无框架依赖，兼容任意 OpenAI 兼容接口。
 
+- 版本变更：[CHANGELOG.md](CHANGELOG.md) ｜ 待办计划：[TODO.md](TODO.md)
+
 ## 快速开始
 
 ```bash
@@ -140,6 +142,9 @@ bluecode/
 ├── .env.example        # 配置模板（入库），复制为 .env 后填真实值
 ├── .env                # 本地配置（不入库，含密钥）
 ├── design.md           # v0.1 设计稿（历史文档，实现已演进超出）
+├── design-web.md       # Web 控制台设计与协议（全部落地，偏差见 §15）
+├── CHANGELOG.md        # 已完成版本变更记录（v0.1 → v0.8.4）
+├── TODO.md             # 未实现 backlog 与计划
 └── benchmarks/
     ├── quixbugs/       # QuixBugs 修 bug 基准（40 题 = 31 简单 + 9 图算法，见 README）
     │   ├── prepare.py        # 题库提取
@@ -210,30 +215,10 @@ python3 benchmarks/bugsinpy/run_benchmark.py        # 全量
 「buggy 失败 ∧ fixed 通过」精确收敛（元数据漂移会产生 buggy/fixed 都失败的环境坏测试，
 纯基线采集会误收）。详见 `benchmarks/bugsinpy/README.md`。
 
-## Roadmap
+## 版本历史
 
-| 版本 | 内容 | 状态 |
-|---|---|---|
-| v0.1 | 单文件跑通 plan→act→guard→review 全流程 + CLI 交互 | ✅ 已实现 |
-| v0.2 | `SqliteSaver` 持久化 + 多轮会话 + 斜杠命令 + `--resume` | ✅ 已实现 |
-| v0.2.5 | reviewer 风格收敛（去毒舌人设）+ planner 条件化 + verifier 自动验证节点 | ✅ 已实现 |
-| v0.3 | 借鉴 smolagents：`final_answer` 显式终止 + 命令白名单 + `plan_run_python` 受限沙箱 + step 回调注册机制 | ✅ 已实现 |
-| v0.4 | QuixBugs benchmark（31 题修 bug 判分）+ `--auto-approve` 模式 | ✅ 已实现 |
-| v0.4.5 | reviewer 判定 fail-closed + 判分管线修复 + benchmark 扩至 40 题（+9 图算法）+ runner 并行 | ✅ 已实现 |
-| v0.5 | 多文件并行修改：`Send` 扇出 worker + reducer 聚合 + 一次性审批 | ✅ 已实现 |
-| v0.5.x | 日志两层 + token 追踪 + 滑动窗口 + 安全加固 + CLI 颜色 + executed_changes + 审批预览/详情 + 工具易用性 | ✅ 已实现 |
-| v0.6 | 审批与信任：diff 渲染（rich/pygments）、逐条审批（序号选择批准）、`/undo` 快照回退、审计日志 `audit.jsonl`、CI 退出码、成本播报 | ✅ 已实现 |
-| v0.7 阶段一 | `/retry` 断点续跑（崩溃/重启/审批点三场景统一）+ LLM 瞬时错误自动退避重试 + 权限分级 `.blue.toml`（两层配置，allow/ask/deny 三档） | ✅ 已实现 |
-| v0.7 阶段二 | 产品化分发：`pyproject.toml` + `blue` 命令（pipx 安装）、`blue init` 引导 / `blue doctor` 自检、配置三层（环境变量 > 项目 .env > 全局 ~/.blue/.env） | ✅ 已实现 |
-| v0.7.1 | #7 模块拆分：agent.py 拆为 facade + session/cli/doctor 三个子模块（显式重导出，测试零改动）；沙箱安全收口（`_safe_os` 受限代理拦 system/popen/exec*/environ）+ guard 异常兜底 | ✅ 已实现 |
-| v0.7.2 | 多模型管理：`~/.blue/models.toml` 注册表 + `/model` 会话中切换（清缓存即时生效）+ 上下文占用百分比显示（轮末播报与 /history） | ✅ 已实现 |
-| v0.7.3 | benchmark 双判据：FAIL_TO_PASS/PASS_TO_PASS（报告区分「未修复」与「修坏回归」，为 BugsInPy 铺判据基础设施） | ✅ 已实现 |
-| v0.8 | Web 控制台核心（`design-web.md` M0–M2：FastAPI+SSE 骨架、审批闭环、会话管理） | ✅ 已实现 |
-| v0.8.1 | BugsInPy pilot（独立 venv + 精确 F2P/P2P 判分；python_version 钉旧解释器、坏钉放宽；`--self-test` 加题门槛） | ✅ 已实现（pilot：httpie/2 自验+E2E；扩量待补题） |
-| v0.8.2| Web 观测增强：图小地图 / token·上下文面板 / 审计尾部 / 模型切换器（M3+M4） | ✅ 已实现（benchmark 结果查看器 → backlog） |
-| backlog | token 级流式输出 + Ctrl-C 打断（astream_events，Web 协议已预留 delta 事件）、prompts 中英双语化、BugsInPy 扩量、benchmark 结果查看器（读 `results/run-*.json`，依赖 v0.9 数据） | 暂缓 |
-
-> LangGraph Studio 已从 backlog 关闭：v0.8 的图小地图 + 事件流满足其约 80% 需求，不再单独集成。
+- **已完成**：变更记录见 [CHANGELOG.md](CHANGELOG.md)（v0.1 → v0.8.4，倒序）。
+- **计划中**：未实现的 backlog 见 [TODO.md](TODO.md)（token 级流式输出、prompts 双语化、BugsInPy 扩量、benchmark 结果查看器、Web 审批快捷键/命令面板等）。
 
 ## 安全说明（重要）
 
