@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bluecode"
-version = "0.8.2"
+version = "0.8.3"
 description = "小蓝 Blue —— 基于 LangGraph 的本地个人 coding agent"
 readme = "README.md"
 requires-python = ">=3.11"

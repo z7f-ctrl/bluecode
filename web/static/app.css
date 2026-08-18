@@ -495,3 +495,35 @@ details.node[open] summary::before { transform: rotate(90deg); }
 .audit-row { padding: 6px 0; border-bottom: 1px solid var(--border); }
 .audit-line { white-space: pre-wrap; word-break: break-all; }
 .audit-changes { margin-top: 2px; white-space: pre-wrap; word-break: break-all; }
+
+/* ─────────────────────────── Markdown 渲染（v0.8.3：报告） ─────────────────────────── */
+
+.md { line-height: 1.6; word-break: break-word; font-size: 13px; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 0.6em 0 0.3em; line-height: 1.3; }
+.md h1 { font-size: 16px; }
+.md h2 { font-size: 15px; }
+.md h3 { font-size: 14px; }
+.md h4, .md h5, .md h6 { font-size: 13px; }
+.md p { margin: 0.4em 0; }
+.md code {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 4px; font-family: var(--mono); font-size: 12px;
+}
+.md pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; overflow-x: auto; margin: 0.5em 0;
+}
+.md pre code { background: none; border: none; padding: 0; font-size: 12px; }
+.md ul, .md ol { margin: 0.4em 0; padding-left: 1.5em; }
+.md li { margin: 0.15em 0; }
+.md blockquote {
+  margin: 0.4em 0; padding: 2px 0 2px 0.8em;
+  border-left: 3px solid var(--border-strong); color: var(--dim);
+}
+.md hr { border: none; border-top: 1px solid var(--border-strong); margin: 0.8em 0; }
+.md a { color: var(--accent); }
+.md table { border-collapse: collapse; margin: 0.5em 0; font-size: 12px; width: 100%; }
+.md th, .md td { border: 1px solid var(--border-strong); padding: 4px 8px; text-align: left; }
+.md th { background: var(--bg-card); font-weight: 600; }

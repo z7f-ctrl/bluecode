@@ -276,6 +276,180 @@ async function openAudit() {
   }
 }
 
+// ── Markdown 渲染（v0.8.3）：报告从纯文本升级为轻量 Markdown ──
+// XSS 安全基线：只用 createElement/createTextNode + textContent 建 DOM，绝不 innerHTML
+// 插入模型内容。子集：标题 / 粗体 / 斜体 / 行内代码 / 围栏代码块 / 列表 / 引用 /
+// 表格 / 分隔线 / 链接（仅 http/https，target=_blank + rel=noopener）。无法解析时
+// 回退纯文本，绝不抛异常。
+const MD_INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[[^\]\n]+\]\([^)\s]+\))/g;
+
+function mdUrl(href) {
+  try {
+    const u = new URL(href, window.location.href);
+    if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+  } catch { /* 非法 URL 不生成链接 */ }
+  return null;
+}
+function renderInline(text) {
+  const frag = document.createDocumentFragment();
+  for (const p of String(text).split(MD_INLINE_RE)) {
+    if (!p) continue;
+    if (p.startsWith("**") && p.endsWith("**") && p.length > 4) {
+      const s = document.createElement("strong");
+      s.textContent = p.slice(2, -2);
+      frag.append(s);
+    } else if (p.startsWith("`") && p.endsWith("`") && p.length > 2) {
+      const c = document.createElement("code");
+      c.textContent = p.slice(1, -1);
+      frag.append(c);
+    } else if (p.startsWith("*") && p.endsWith("*") && p.length > 2) {
+      const e = document.createElement("em");
+      e.textContent = p.slice(1, -1);
+      frag.append(e);
+    } else if (p.startsWith("[")) {
+      const m = p.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      const href = m && mdUrl(m[2]);
+      if (href) {
+        const a = document.createElement("a");
+        a.href = href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = m[1];
+        frag.append(a);
+      } else {
+        frag.append(document.createTextNode(p));
+      }
+    } else {
+      frag.append(document.createTextNode(p));
+    }
+  }
+  return frag;
+}
+function mdStartsBlock(line) {
+  const t = line.trim();
+  return !t || /^(#{1,6})\s/.test(t) || /^```/.test(t) || t.startsWith(">")
+    || t.startsWith("|") || /^([-*+]|\d+\.)\s/.test(t) || /^(---+|\*\*\*+)$/.test(t);
+}
+function renderMarkdown(text) {
+  const root = document.createElement("div");
+  root.className = "md";
+  const lines = String(text ?? "").replace(/\r\n/g, "\n").split("\n");
+  const total = lines.length;
+  let i = 0;
+  const n = (tag) => document.createElement(tag);
+  while (i < lines.length && i < MAX_RENDER_LINES) {
+    const t = lines[i].trim();
+    // 围栏代码块
+    const fence = t.match(/^```(\w*)/);
+    if (fence) {
+      const buf = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith("```"); i++) buf.push(lines[i]);
+      i++; // 跳过收尾 ```
+      const pre = n("pre");
+      pre.className = "code-lines md-code" + (fence[1] ? ` lang-${fence[1]}` : "");
+      const code = n("code");
+      code.textContent = buf.join("\n");
+      pre.append(code);
+      root.append(pre);
+      continue;
+    }
+    // 标题
+    const h = t.match(/^(#{1,6})\s+(.+)$/);
+    if (h) {
+      const node = n("h" + h[1].length);
+      node.append(renderInline(h[2]));
+      root.append(node);
+      i++;
+      continue;
+    }
+    // 分隔线
+    if (/^(---+|\*\*\*+)$/.test(t) && t.length >= 3) {
+      root.append(n("hr"));
+      i++;
+      continue;
+    }
+    // 引用
+    if (t.startsWith(">")) {
+      const buf = [];
+      while (i < lines.length && lines[i].trim().startsWith(">")) {
+        buf.push(lines[i].trim().replace(/^>\s?/, ""));
+        i++;
+      }
+      const q = n("blockquote");
+      q.append(renderInline(buf.join(" ")));
+      root.append(q);
+      continue;
+    }
+    // 表格：当前行以 | 开头，且下一行是分隔行（|--:| 之类）
+    if (t.startsWith("|") && lines[i + 1] && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        rows.push(lines[i].trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+        i++;
+      }
+      const hasHeader = rows.length >= 2 && rows[1].every((c) => /^:?-+:?$/.test(c));
+      const table = n("table");
+      if (hasHeader) {
+        const thead = n("thead");
+        const tr = n("tr");
+        for (const c of rows[0]) {
+          const th = n("th");
+          th.append(renderInline(c));
+          tr.append(th);
+        }
+        thead.append(tr);
+        table.append(thead);
+      }
+      const tbody = n("tbody");
+      for (let r = hasHeader ? 2 : 0; r < rows.length; r++) {
+        const tr = n("tr");
+        for (const c of rows[r]) {
+          const td = n("td");
+          td.append(renderInline(c));
+          tr.append(td);
+        }
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      root.append(table);
+      continue;
+    }
+    // 列表
+    const li = t.match(/^([-*+]|\d+\.)\s+(.*)$/);
+    if (li) {
+      const list = n(/\d+\./.test(li[1]) ? "ol" : "ul");
+      while (i < lines.length) {
+        const m = lines[i].trim().match(/^([-*+]|\d+\.)\s+(.*)$/);
+        if (!m) break;
+        const item = n("li");
+        item.append(renderInline(m[2]));
+        list.append(item);
+        i++;
+      }
+      root.append(list);
+      continue;
+    }
+    // 空行
+    if (!t) {
+      i++;
+      continue;
+    }
+    // 段落：合并到下一个块起点
+    const buf = [t];
+    for (i++; i < lines.length && !mdStartsBlock(lines[i]); i++) buf.push(lines[i].trim());
+    const p = n("p");
+    p.append(renderInline(buf.join(" ")));
+    root.append(p);
+  }
+  if (total > MAX_RENDER_LINES) {
+    const note = n("div");
+    note.className = "code-row hunk";
+    note.textContent = `…（共 ${total} 行，仅渲染前 ${MAX_RENDER_LINES} 行）`;
+    root.append(note);
+  }
+  return root;
+}
+
 // ── 流区域操作 ──
 const nearBottom = () => {
   const s = $("#stream");
@@ -598,8 +772,15 @@ function nodeCard(nodeName, data) {
     el("span", "node-label", NODE_LABELS[nodeName] || nodeName || "node"),
     el("span", "node-name dim", nodeName || ""));
   det.append(sum);
-  const text = nodeDataText(nodeName, data);
-  det.append(nodeName === "verifier" ? coloredLinesPre(text) : pre("node-pre", text));
+  // v0.8.3：报告（feedback/report 字段）渲染轻量 Markdown；其余节点维持纯文本/着色
+  const report = nodeName === "report"
+    ? (data?.feedback ?? data?.report ?? data?.last_report) : null;
+  if (typeof report === "string" && report.trim()) {
+    det.append(renderMarkdown(report));
+  } else {
+    const text = nodeDataText(nodeName, data);
+    det.append(nodeName === "verifier" ? coloredLinesPre(text) : pre("node-pre", text));
+  }
   appendCard(det);
 }
 

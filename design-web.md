@@ -391,7 +391,7 @@ M0–M2 实现与本文的偏离，全部记录在案（实现方与协议方共
 
 | 本文 § | 设计 | 实现 | 影响 |
 |---|---|---|---|
-| §7.4 / §9 Markdown | vendored marked + DOMPurify 渲染报告 | **一律 `textContent`，绝不 innerHTML**（零第三方 JS、零供应链） | XSS 面更小；报告暂以纯文本展示、不渲染 Markdown（升级点：引入 sanitizer 即可，协议不变） |
+| §7.4 / §9 Markdown | vendored marked + DOMPurify 渲染报告 | **手写 DOM Markdown 渲染器**（v0.8.3）：只 createElement + textContent 建节点，**绝不 innerHTML 模型内容**（零第三方 JS、零供应链） | XSS 面小；报告渲染轻量 Markdown（标题/粗体/代码块/列表/引用/表格/链接），链接白名单 http/https（`javascript:` 等降级纯文本）；协议不变 |
 | §5 审计 | 调 `agent._audit_log` 记 source | web 层 `_audit_log_web` 独立写同一 jsonl、逐字段镜像 | 核心 `_audit_log` 只抄 action/indices/note 三键、source 会被静默丢弃（读码确认）；独立写保住 `source: web` 区分 |
 | §7.1 token | 非 loopback 无 token 拒绝启动 | **缺省自动生成随机 token 打印**（`--token` / `BLUE_WEB_TOKEN` 可固定） | 更便捷且仍 fail-closed（token 强制校验所有 /api） |
 | §4.2 SSE 鉴权 | 未规定 | token 模式走 `?token=` 查询参数 | EventSource 不能带 header 的妥协；URL 有日志暴露面，默认 loopback 模式无此问题 |
