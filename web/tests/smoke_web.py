@@ -466,6 +466,28 @@ def test_health_masking_and_token():
     print("PASS health 掩码 + token 模式 Bearer 校验 ✔\n")
 
 
+def test_static_assets_served():
+    """前端静态资源：index.html 必须用 /static/ 前缀引用（server 把 static 挂到 /static），
+    且 /static/app.css|js 可访问——防止回归：相对引用 app.css 在 / 下解析成 /app.css 而 404，
+    导致 UI 无样式/无脚本（blue web 实际跑起来页面全坏）。"""
+    p1, p2, p3 = model_patches(FakeModel([]))
+    with p1, p2, p3:
+        app, _ = make_app()
+        with TestClient(app) as client:
+            r = client.get("/")
+            assert r.status_code == 200, r.text
+            html = r.text
+            assert "/static/app.css" in html, f"index.html 未用 /static/ 前缀引用 css：{html[:200]}"
+            assert "/static/app.js" in html, f"index.html 未用 /static/ 前缀引用 js：{html[:200]}"
+            rc = client.get("/static/app.css")
+            assert rc.status_code == 200, rc.text
+            rj = client.get("/static/app.js")
+            assert rj.status_code == 200, rj.text
+            # 反向守卫：相对引用路径不应再被服务（确认挂载点是 /static 而非根）
+            assert client.get("/app.css").status_code == 404
+    print("PASS 静态资源：/ 引用 /static/* 且 /static/app.css|js 可访问 ✔\n")
+
+
 def test_415_and_host_guard():
     """POST 非 JSON → 415；非 loopback 强制 token：缺省自动生成随机 token 打印（Jupyter 式），
     显式提供（--token）时不生成（fail-closed 语义不变：token 模式所有 /api 校验 Bearer）。"""
@@ -580,6 +602,7 @@ if __name__ == "__main__":
     test_retry_nothing_pending()
     test_undo_endpoint()
     test_health_masking_and_token()
+    test_static_assets_served()
     test_415_and_host_guard()
     test_diff_helpers()
     test_no_cross_session_event_leak()
