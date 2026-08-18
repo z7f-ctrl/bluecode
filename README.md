@@ -10,7 +10,7 @@
 # 方式一（推荐，v0.7 起）：pipx 安装为全局命令
 pipx install '.[web]'   # [web] = 可选 Web 控制台（v0.8，需 fastapi/uvicorn）
 blue init       # 交互式配置（key 不回显，写 ~/.blue/.env，任意目录可用）
-blue doctor     # 自检：环境/依赖/配置/API 可达/模型存在/tool calling
+blue doctor     # 自检：环境/依赖/配置/目录可写/API 与模型/tool calling
 blue "给 hello.py 加上错误处理，并写一个 pytest 测试"
 
 # 方式二：源码直跑
@@ -120,10 +120,11 @@ BLUE_COMMAND_WHITELIST=python3,pytest,ls,cat
 
 ```
 bluecode/
-├── agent.py            # 状态、7 节点、建图、主循环（facade：重导出 session/cli/doctor，~1430 行）
+├── agent.py            # 状态、7 节点、建图、主循环（facade：重导出 session/cli/doctor，~1500 行）
 ├── session.py          # Session 会话管理 + sessions 表 + 目录常量（#7 拆分）
 ├── cli.py              # 斜杠命令、审批渲染、step 回调、交互主循环（#7 拆分）
 ├── doctor.py           # blue init / blue doctor 自检（#7 拆分）
+├── models.py           # 多模型注册表 models.toml + /model 切换 + 上下文窗口（v0.7.2）
 ├── tools.py            # 10 工具 + 安全校验（命令/Python 双路径 + .blue.toml 权限分级）
 ├── prompts.py          # planner / agent / worker / reviewer / report 提示词（文案集中）
 ├── pyproject.toml      # 打包配置（console_scripts：blue = agent:main）
